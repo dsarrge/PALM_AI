@@ -1,127 +1,113 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Feb  8 11:54:02 2026
+﻿from __future__ import annotations
 
-@author: dsarr
-
-PALM Food AI
-Log food consumption (barcode + grams)
-food_ai/core/log_consumption.py
-"""
-# -*- coding: utf-8 -*-
-"""
-PALM Food AI
-Log food consumption (barcode + grams)
-"""
-
+from contextlib import closing
+from datetime import datetime, timezone
 import sqlite3
-from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-from food_ai.core.barcode_lookup import lookup_barcode
-from food_ai.core.nutrition_engine import normalize_nutrition
+from food_ai.barcode.service import lookup_local_barcode, record_unknown_barcode
 
-# Intake scaling
-def scale_intake(per_100g: dict, grams: float) -> dict:
-    factor = grams / 100.0
+
+def _consumption_log_columns(connection: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in connection.execute("PRAGMA table_info(consumption_logs)").fetchall()}
+
+
+def _ensure_consumption_logs_table(connection: sqlite3.Connection) -> set[str]:
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS consumption_logs (log_id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, ref_id TEXT, grams_consumed REAL NOT NULL, consumed_at TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+    )
+    return _consumption_log_columns(connection)
+
+
+def _macro_snapshot_for_quantity(product: dict[str, Any], quantity_grams: float) -> dict[str, float]:
+    nutrition = product.get("nutrition") or {}
+    scale = float(quantity_grams) / 100.0
     return {
-        k: (v * factor if v is not None else None)
-        for k, v in per_100g.items()
+        "calories": float(nutrition.get("calories") or 0.0) * scale,
+        "protein_g": float(nutrition.get("protein_g") or 0.0) * scale,
+        "total_fat_g": float(nutrition.get("total_fat_g") or 0.0) * scale,
+        "total_carbs_g": float(nutrition.get("total_carbs_g") or 0.0) * scale,
     }
 
-# Intake validation
-def validate_intake(intake: dict) -> dict:
-    flags = []
 
-    for k, v in intake.items():
-        if v is None:
-            flags.append(f"missing_{k}")
-        elif v < 0:
-            flags.append(f"negative_{k}")
+def _insert_with_available_columns(connection: sqlite3.Connection, columns: set[str], payload: dict[str, Any]) -> None:
+    ordered = [key for key in payload if key in columns]
+    if not ordered:
+        raise sqlite3.OperationalError("No compatible consumption_logs columns for insert payload")
+    placeholders = ", ".join(["?"] * len(ordered))
+    sql = f"INSERT INTO consumption_logs ({', '.join(ordered)}) VALUES ({placeholders})"
+    values = tuple(payload[key] for key in ordered)
+    connection.execute(sql, values)
 
-    confidence = 1.0
-    if flags:
-        confidence -= 0.3
+
+def log_consumption(barcode: str, quantity: float, db_path: str | Path) -> dict[str, Any]:
+    quantity_value = float(quantity)
+    if quantity_value <= 0.0:
+        raise ValueError("quantity must be > 0")
+
+    product = lookup_local_barcode(barcode, db_path)
+    if product is None:
+        try:
+            record_unknown_barcode(barcode, db_path)
+        except sqlite3.OperationalError as exc:
+            if "unknown_barcodes" not in str(exc).lower():
+                raise
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS unknown_barcodes (barcode TEXT PRIMARY KEY, first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+                )
+                connection.execute("INSERT OR IGNORE INTO unknown_barcodes (barcode) VALUES (?)", (barcode,))
+                connection.commit()
+        return {"status": "unknown_barcode", "barcode": barcode, "quantity": quantity}
+
+    consumed_at = datetime.now(timezone.utc).isoformat()
+    nutrition_snapshot = _macro_snapshot_for_quantity(product, quantity_value)
+
+    with closing(sqlite3.connect(db_path)) as connection:
+        columns = _ensure_consumption_logs_table(connection)
+        if {"source", "ref_id", "grams_consumed", "consumed_at"}.issubset(columns):
+            payload: dict[str, Any] = {
+                "source": "barcode",
+                "ref_id": barcode,
+                "grams_consumed": quantity_value,
+                "consumed_at": consumed_at,
+            }
+            if "confidence" in columns:
+                payload["confidence"] = 1.0
+            if "flags" in columns:
+                payload["flags"] = None
+            payload.update(nutrition_snapshot)
+            _insert_with_available_columns(connection, columns, payload)
+            mode = "source_ref_id"
+        elif {"barcode", "grams_consumed"}.issubset(columns):
+            payload = {
+                "barcode": barcode,
+                "grams_consumed": quantity_value,
+                "consumed_at": consumed_at,
+            }
+            payload.update(nutrition_snapshot)
+            _insert_with_available_columns(connection, columns, payload)
+            mode = "barcode_grams"
+        elif {"barcode", "quantity"}.issubset(columns):
+            payload = {
+                "barcode": barcode,
+                "quantity": quantity_value,
+                "consumed_at": consumed_at,
+            }
+            payload.update(nutrition_snapshot)
+            _insert_with_available_columns(connection, columns, payload)
+            mode = "barcode_quantity"
+        else:
+            raise sqlite3.OperationalError(f"Unsupported consumption_logs schema columns: {sorted(columns)}")
+        connection.commit()
 
     return {
-        "valid": confidence > 0.5,
-        "confidence": max(0.0, confidence),
-        "flags": flags
-    }
-
-# Log consumption
-def log_consumption(barcode: str, grams: float, db_path):
-    if grams <= 0:
-        raise ValueError("grams must be > 0")
-
-    # Lookup product (offline-first)
-    product = lookup_barcode(barcode)
-
-    per_100g = {
-        k: (product.get(k) if product.get(k) is not None else 0.0)
-        for k in (
-            "calories",
-            "protein_g",
-            "total_fat_g",
-            "total_carbs_g",
-            "fiber_g",
-            "total_sugars_g",
-            "sodium_mg",
-            "cholesterol_mg",
-        )
-    }
-
-    # Normalize + validate base nutrition
-    normalized = normalize_nutrition(per_100g)
-
-    # Scale to actual intake
-    intake = scale_intake(normalized["per_100g"], grams)
-
-    # Validate scaled intake
-    validation = validate_intake(intake)
-
-    # Store consumption event
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO consumption_logs (
-            barcode,
-            grams_consumed,
-            consumed_at
-        ) VALUES (?, ?, ?)
-    """, (
-        barcode,
-        grams,
-        datetime.utcnow().isoformat()
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return {
+        "status": "logged",
         "barcode": barcode,
-        "grams": grams,
-        "intake": intake,
-        "validation": validation,
-        "nutrition_quality": normalized["quality"],
-        "source": product.get("source")
+        "quantity": quantity,
+        "product": product,
+        "log_mode": mode,
+        "consumed_at": consumed_at,
+        "nutrition_snapshot": nutrition_snapshot,
     }
-
-# CLI test
-if __name__ == "__main__":
-    while True:
-        barcode = input("Barcode (ENTER to quit): ").strip()
-        if not barcode:
-            break
-
-        grams = float(input("Grams consumed: "))
-        result = log_consumption(barcode, grams)
-
-        print("\nLOGGED:")
-        for k, v in result["intake"].items():
-            print(f"{k}: {round(v, 2) if v is not None else 'NA'}")
-
-        print("confidence:", result["validation"]["confidence"])
-        if result["validation"]["flags"]:
-            print("flags:", result["validation"]["flags"])
-        print("-" * 30)

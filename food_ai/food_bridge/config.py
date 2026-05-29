@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from food_ai.config import ARTIFACTS_DIR, DATA_DIR, DB_PATH, FOOD101_DATA_DIR, PROJECT_ROOT
+
+
+RECIPE_NLG_PATH_CANDIDATES = (
+    DATA_DIR / "RecipeNLG" / "RecipeNLG_dataset.csv",
+    DATA_DIR / "RecipeNLG_dataset.csv",
+)
+
+FOOD_BRIDGE_ARTIFACTS_DIR = ARTIFACTS_DIR / "food_bridge"
+DISH_PRIORS_PATH = FOOD_BRIDGE_ARTIFACTS_DIR / "dish_priors.json"
+DISH_MASS_PRIORS_PATH = FOOD_BRIDGE_ARTIFACTS_DIR / "dish_mass_priors.json"
+USDA_DATA_DIR = DATA_DIR / "USDA"
+USDA_FOOD_PORTION_PATH = USDA_DATA_DIR / "food_portion.csv"
+USDA_MEASURE_UNIT_PATH = USDA_DATA_DIR / "measure_unit.csv"
+NUTRITION5K_DATA_DIR = DATA_DIR / "Nutrition5k"
+NUTRITION5K_DISH_INGREDIENTS_PATH = NUTRITION5K_DATA_DIR / "dish_ingredients.csv"
+NUTRITION5K_DISH_NUTRITION_PATH = NUTRITION5K_DATA_DIR / "dish_nutrition_values.csv"
+NUTRITION5K_INGREDIENTS_METADATA_PATH = NUTRITION5K_DATA_DIR / "ingredients_metadata.csv"
+NUTRITION5K_MASS_PRIORS_PATH = FOOD_BRIDGE_ARTIFACTS_DIR / "nutrition5k_mass_priors.json"
+VISION_CLASS_INDEX_PATH = ARTIFACTS_DIR / "vision" / "classifier" / "class_index.json"
+FOOD101_IMAGE_DIR = FOOD101_DATA_DIR / "images"
+
+MIN_RECIPE_MATCHES = 3
+TOP_INGREDIENTS_PER_DISH = 20
+NUTRITION5K_MIN_OVERLAP_SCORE = 0.25
+NUTRITION5K_TOP_MATCHES = 25
+NUTRITION5K_MIN_MATCHED_DISHES = 3
+
+
+def resolve_recipe_nlg_path(path: str | Path | None = None) -> Path:
+    if path is not None:
+        return Path(path)
+    for candidate in RECIPE_NLG_PATH_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return RECIPE_NLG_PATH_CANDIDATES[0]
+
+
+__all__ = [
+    "ARTIFACTS_DIR",
+    "DATA_DIR",
+    "DB_PATH",
+    "DISH_MASS_PRIORS_PATH",
+    "DISH_PRIORS_PATH",
+    "FOOD101_IMAGE_DIR",
+    "FOOD_BRIDGE_ARTIFACTS_DIR",
+    "MIN_RECIPE_MATCHES",
+    "NUTRITION5K_DATA_DIR",
+    "NUTRITION5K_DISH_INGREDIENTS_PATH",
+    "NUTRITION5K_DISH_NUTRITION_PATH",
+    "NUTRITION5K_INGREDIENTS_METADATA_PATH",
+    "NUTRITION5K_MASS_PRIORS_PATH",
+    "NUTRITION5K_MIN_MATCHED_DISHES",
+    "NUTRITION5K_MIN_OVERLAP_SCORE",
+    "NUTRITION5K_TOP_MATCHES",
+    "PROJECT_ROOT",
+    "RECIPE_NLG_PATH_CANDIDATES",
+    "TOP_INGREDIENTS_PER_DISH",
+    "USDA_FOOD_PORTION_PATH",
+    "USDA_MEASURE_UNIT_PATH",
+    "VISION_CLASS_INDEX_PATH",
+    "resolve_recipe_nlg_path",
+]

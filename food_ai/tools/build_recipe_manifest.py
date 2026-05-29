@@ -1,63 +1,76 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Jan  1 20:00:42 2026
+from __future__ import annotations
 
-@author: dsarr
-
-food_ai/tools/build_recipe_manifest.py
-"""
-import re
+import argparse
+import ast
+import csv
 import json
 from pathlib import Path
-from datetime import datetime, timezone
-import pandas as pd
+from typing import Any
 
-ARTIFACTS = Path("C:/PALM/artifacts")
-DATA_CSV = Path("C:/PALM/food_ai/data/RecipeNLG_dataset.csv")
+from food_ai.config import resolve_recipe_data_path
 
-DISH_LABELS = ARTIFACTS / "dish_labels_v2.json"
-OUT_MANIFEST = ARTIFACTS / "dish_recipe_manifest.json"
 
-def build_recipe_manifest():
-    # Load dishes
-    with open(DISH_LABELS, "r", encoding="utf-8") as f:
-        dishes = json.load(f)
+def _safe_list_count(value: Any) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        parsed = ast.literal_eval(str(value))
+    except (ValueError, SyntaxError):
+        return len([part for part in str(value).split(",") if part.strip()])
+    if isinstance(parsed, (list, tuple)):
+        return len(parsed)
+    return 1
 
-    # Load dataset
-    df = pd.read_csv(DATA_CSV, usecols=["title", "ingredients"])
-    df["title"] = df["title"].astype(str).str.lower()
 
-    manifest = {
-        "version": "v2",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "normalizer": "ingredient_normalizer_v1",
-        "dishes": []
-    }
-    
-    for dish_key in dishes:
-        dish_name = dish_key.replace("_", " ")
-        tokens = dish_name.split()
-        pattern = ".*".join(map(re.escape, tokens))
-        
-        matched = df[
-            df["title"].str.contains(pattern, regex=True)
-        ]
-        
-        if matched.empty:
-            continue
+def build_recipe_manifest(recipe_csv_path: str | Path | None, output_path: str | Path) -> Path:
+    source_path = resolve_recipe_data_path(recipe_csv_path)
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
-        manifest["dishes"].append({
-            "dish_key": dish_key,
-            "recipe_ids": matched.index.tolist(),
-            "recipe_count": len(matched),
-        })
-    
-        print(f"[OK] {dish_key}: {len(matched)} recipes")
+    write_jsonl = destination.suffix.lower() == ".jsonl"
+    with source_path.open("r", encoding="utf-8", newline="") as source_handle, destination.open("w", encoding="utf-8", newline="") as output_handle:
+        reader = csv.DictReader(source_handle)
+        if write_jsonl:
+            for index, row in enumerate(reader):
+                payload = {
+                    "recipe_id": row.get("Unnamed: 0", index),
+                    "title": row.get("title", ""),
+                    "link": row.get("link", ""),
+                    "source": row.get("source", ""),
+                    "ingredient_count": _safe_list_count(row.get("ingredients")),
+                    "ner_count": _safe_list_count(row.get("NER")),
+                    "direction_count": _safe_list_count(row.get("directions")),
+                }
+                output_handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        else:
+            output_handle.write("[\n")
+            first = True
+            for index, row in enumerate(reader):
+                payload = {
+                    "recipe_id": row.get("Unnamed: 0", index),
+                    "title": row.get("title", ""),
+                    "link": row.get("link", ""),
+                    "source": row.get("source", ""),
+                    "ingredient_count": _safe_list_count(row.get("ingredients")),
+                    "ner_count": _safe_list_count(row.get("NER")),
+                    "direction_count": _safe_list_count(row.get("directions")),
+                }
+                if not first:
+                    output_handle.write(",\n")
+                output_handle.write(json.dumps(payload, ensure_ascii=True))
+                first = False
+            output_handle.write("\n]\n")
+    return destination
 
-    with open(OUT_MANIFEST, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
 
-    print(f"\n[SAVED] {OUT_MANIFEST}")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build a compact RecipeNLG manifest from the raw CSV dataset.")
+    parser.add_argument("--recipe-csv", type=Path, default=None)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    output = build_recipe_manifest(args.recipe_csv, args.output)
+    print(output)
+
 
 if __name__ == "__main__":
-    build_recipe_manifest()
+    main()

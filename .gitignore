@@ -1,15 +1,68 @@
-# Environment / secrets
+﻿# Python
+__pycache__/
+*.pyc
 .env
+.venv/
+venv/
+
+# Local databases
+shared/*.db
+*.sqlite
+*.sqlite3
+
+# Generated outputs / cache
+artifacts/
+shared/audit/
+*.log
+
+# Large raw datasets
+food_ai/data/USDA/
+food_ai/data/RecipeNLG/
+food_ai/data/food-101/
+
+# IDE / OS
+.vscode/
+.idea/
+.spyproject/
+.DS_Store
+Thumbs.db
+
+# Local env/secrets
 env.py
+.env
+.venv/
+venv/
 
-# Databases
-*.db
-shared/
-
-# Python
+# Python cache
 __pycache__/
 *.pyc
 
-# OS junk
+# Local databases
+shared/*.db
+*.sqlite
+*.sqlite3
+trading_lab.db
+
+# Generated outputs / audits
+artifacts/
+shared/audit/
+shared/PALM_V2_audit_*/
+shared/*audit*.zip
+*.log
+
+# Large/raw datasets and embeddings
+food_ai/data/USDA/
+food_ai/data/RecipeNLG/
+food_ai/data/food-101/
+food_ai/data/Nutrition5k/
+food_ai/data/*.pkl
+
+# Local docs/exports
+shared/*.pdf
+
+# IDE / OS
+.vscode/
+.idea/
+.spyproject/
 .DS_Store
 Thumbs.db

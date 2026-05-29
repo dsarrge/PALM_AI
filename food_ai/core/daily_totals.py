@@ -1,110 +1,96 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Feb  8 12:12:43 2026
+﻿from __future__ import annotations
 
-@author: dsarr
-
-PALM Food AI
-Daily nutrition totals
-food_ai/core/daily_totals.py
-"""
-from datetime import date
-from typing import Dict
+from contextlib import closing
 import sqlite3
 from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parents[2]
-DB_PATH = BASE_DIR / "shared" / "palm.db"
+from typing import Any
 
 
-def fetch_consumption_for_day(day: date):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT
-            c.barcode,
-            c.grams_consumed,
-            c.consumed_at,
-            nf.calories,
-            nf.protein_g,
-            nf.total_fat_g,
-            nf.total_carbs_g,
-            nf.fiber_g,
-            nf.total_sugars_g,
-            nf.added_sugars_g,
-            nf.sodium_mg,
-            nf.cholesterol_mg
-        FROM consumption_logs c
-        JOIN barcodes b ON c.barcode = b.barcode
-        JOIN nutrition_facts nf ON b.product_id = nf.product_id
-        WHERE DATE(c.consumed_at) = ?
-    """, (day.isoformat(),))
-
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+NUTRITION_KEYS = ("calories", "protein_g", "total_fat_g", "total_carbs_g")
 
 
-def aggregate_daily_totals(rows) -> Dict:
-    totals = {
-        "calories": 0.0,
-        "protein_g": 0.0,
-        "total_fat_g": 0.0,
-        "total_carbs_g": 0.0,
-        "fiber_g": 0.0,
-        "total_sugars_g": 0.0,
-        "added_sugars_g": 0.0,
-        "sodium_mg": 0.0,
-        "cholesterol_mg": 0.0,
-        "items_logged": 0
+def _sum_with_where(
+    connection: sqlite3.Connection,
+    select_sql: str,
+    where_clause: str,
+    params: tuple[object, ...],
+) -> float:
+    query = f"{select_sql} {where_clause}".strip()
+    return float(connection.execute(query, params).fetchone()[0] or 0.0)
+
+
+def get_daily_totals(db_path: str | Path, date: str | None = None) -> dict[str, Any]:
+    with closing(sqlite3.connect(db_path)) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(consumption_logs)").fetchall()}
+        amount_column = "grams_consumed" if "grams_consumed" in columns else "quantity"
+        timestamp_column = "consumed_at" if "consumed_at" in columns else "created_at"
+
+        where_clause = ""
+        params: tuple[object, ...] = ()
+        if date:
+            where_clause = f"WHERE date({timestamp_column}) = date(?)"
+            params = (date,)
+
+        try:
+            total_quantity = _sum_with_where(
+                connection,
+                f"SELECT COALESCE(SUM({amount_column}), 0) FROM consumption_logs",
+                where_clause,
+                params,
+            )
+        except sqlite3.OperationalError:
+            total_quantity = 0.0
+
+        nutrition_totals = {key: 0.0 for key in NUTRITION_KEYS}
+        if set(NUTRITION_KEYS).issubset(columns):
+            for key in NUTRITION_KEYS:
+                nutrition_totals[key] = _sum_with_where(
+                    connection,
+                    f"SELECT COALESCE(SUM({key}), 0) FROM consumption_logs",
+                    where_clause,
+                    params,
+                )
+        elif {"source", "ref_id", amount_column}.issubset(columns):
+            for key, nf_column in (
+                ("calories", "calories"),
+                ("protein_g", "protein_g"),
+                ("total_fat_g", "total_fat_g"),
+                ("total_carbs_g", "total_carbs_g"),
+            ):
+                nutrition_totals[key] = _sum_with_where(
+                    connection,
+                    (
+                        "SELECT COALESCE(SUM(COALESCE(nf.{nf_column}, 0) * COALESCE(l.{amount_column}, 0) / 100.0), 0) "
+                        "FROM consumption_logs l "
+                        "LEFT JOIN barcodes b ON b.barcode = l.ref_id "
+                        "LEFT JOIN nutrition_facts nf ON nf.product_id = b.product_id "
+                        "WHERE l.source = 'barcode'"
+                    ).format(nf_column=nf_column, amount_column=amount_column),
+                    f"AND date(l.{timestamp_column}) = date(?)" if date else "",
+                    params,
+                )
+        elif {"barcode", amount_column}.issubset(columns):
+            for key, nf_column in (
+                ("calories", "calories"),
+                ("protein_g", "protein_g"),
+                ("total_fat_g", "total_fat_g"),
+                ("total_carbs_g", "total_carbs_g"),
+            ):
+                nutrition_totals[key] = _sum_with_where(
+                    connection,
+                    (
+                        "SELECT COALESCE(SUM(COALESCE(nf.{nf_column}, 0) * COALESCE(l.{amount_column}, 0) / 100.0), 0) "
+                        "FROM consumption_logs l "
+                        "LEFT JOIN barcodes b ON b.barcode = l.barcode "
+                        "LEFT JOIN nutrition_facts nf ON nf.product_id = b.product_id"
+                    ).format(nf_column=nf_column, amount_column=amount_column),
+                    f"WHERE date(l.{timestamp_column}) = date(?)" if date else "",
+                    params,
+                )
+
+    return {
+        "date": date,
+        "total_quantity": total_quantity,
+        "amount_column": amount_column,
+        "nutrition_totals": nutrition_totals,
     }
-
-    for r in rows:
-        factor = r["grams_consumed"] / 100.0
-
-        for k in (
-            "calories",
-            "protein_g",
-            "total_fat_g",
-            "total_carbs_g",
-            "fiber_g",
-            "total_sugars_g",
-            "added_sugars_g",
-            "sodium_mg",
-            "cholesterol_mg"
-        ):
-            v = r[k]
-            if v is not None:
-                totals[k] += v * factor
-
-        totals["items_logged"] += 1
-
-    return totals
-
-
-def daily_totals(day: date | None = None, db_path=None):
-    if day is None:
-        day = date.today()
-
-    rows = fetch_consumption_for_day(day)
-    totals = aggregate_daily_totals(rows)
-    totals["date"] = day.isoformat()
-    return totals
-
-
-if __name__ == "__main__":
-    totals = daily_totals()
-
-    print(f"\nDAILY TOTALS ({totals['date']})")
-    print("-" * 30)
-    print(f"Calories: {round(totals['calories'])}")
-    print(f"Protein:  {round(totals['protein_g'], 1)} g")
-    print(f"Fat:      {round(totals['total_fat_g'], 1)} g")
-    print(f"Carbs:    {round(totals['total_carbs_g'], 1)} g")
-    print(f"Fiber:    {round(totals['fiber_g'], 1)} g")
-    print(f"Sugar:    {round(totals['total_sugars_g'], 1)} g")
-    print(f"Sodium:   {round(totals['sodium_mg'])} mg")
-    print(f"Items:    {totals['items_logged']}")
-    print("-" * 30)
