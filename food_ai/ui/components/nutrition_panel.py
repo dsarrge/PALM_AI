@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import streamlit as st
 
+from food_ai.ui.services.nutrition_extra_service import added_sugars_from_formatted
+
+
+def _display(value: object) -> object:
+    return "n/a" if value is None else value
+
 
 def render_nutrition_panel(formatted: dict) -> None:
     nutrition = formatted.get("nutrition") or {}
@@ -9,22 +15,29 @@ def render_nutrition_panel(formatted: dict) -> None:
     weighting = nutrition.get("weighting") or {}
     payload = nutrition.get("payload") or {}
     recalc = nutrition.get("recalc") or payload.get("nutrition_recalc") or {}
+    added_sugars_g = added_sugars_from_formatted(formatted)
 
     st.subheader("USDA / Nutrition Bridge")
     columns = st.columns(4)
-    columns[0].metric("Calories", summary.get("calories", "n/a"))
-    columns[1].metric("Protein (g)", summary.get("protein_g", "n/a"))
-    columns[2].metric("Fat (g)", summary.get("fat_g", "n/a"))
-    columns[3].metric("Carbs (g)", summary.get("carbs_g", "n/a"))
-    detail_columns = st.columns(3)
-    detail_columns[0].metric("Fiber (g)", summary.get("fiber_g", "n/a"))
-    detail_columns[1].metric("Sugars (g)", summary.get("total_sugars_g", "n/a"))
-    detail_columns[2].metric("Sodium (mg)", summary.get("sodium_mg", "n/a"))
+    columns[0].metric("Calories", _display(summary.get("calories")))
+    columns[1].metric("Protein (g)", _display(summary.get("protein_g")))
+    columns[2].metric("Fat (g)", _display(summary.get("fat_g")))
+    columns[3].metric("Carbs (g)", _display(summary.get("carbs_g")))
+
+    detail_columns = st.columns(4)
+    detail_columns[0].metric("Fiber (g)", _display(summary.get("fiber_g")))
+    detail_columns[1].metric("Total Sugars (g)", _display(summary.get("total_sugars_g")))
+    detail_columns[2].metric("Added Sugars (g)", _display(added_sugars_g))
+    detail_columns[3].metric("Sodium (mg)", _display(summary.get("sodium_mg")))
+
+    st.caption("Sugar values are grams per 100g dish. Sodium is milligrams per 100g dish. Per-serving save scales both by serving_weight_g / 100.")
 
     st.info(
         payload.get("label")
         or "Estimated nutrition per 100g from dish ingredient priors. This is not a final portion-estimated plated nutrition result from the image."
     )
+    if added_sugars_g is not None:
+        st.caption("Added sugars are shown only when available from source columns or safely inferred for sugar-like ingredients; they are not added into total sugars.")
     if recalc.get("user_exclusions_applied"):
         excluded = ", ".join(recalc.get("excluded_ingredients") or [])
         st.warning(
@@ -43,4 +56,9 @@ def render_nutrition_panel(formatted: dict) -> None:
         )
     )
     with st.expander("PALM-Ready Nutrition Payload", expanded=False):
-        st.json(payload)
+        payload_with_optional = dict(payload)
+        if added_sugars_g is not None:
+            estimated = dict(payload_with_optional.get("estimated_nutrition_per_100g") or {})
+            estimated["added_sugars_g"] = added_sugars_g
+            payload_with_optional["estimated_nutrition_per_100g"] = estimated
+        st.json(payload_with_optional)
