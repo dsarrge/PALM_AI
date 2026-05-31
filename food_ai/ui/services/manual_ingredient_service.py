@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from contextlib import closing
 import copy
 from pathlib import Path
+import sqlite3
 from typing import Any
 
+from food_ai.config import resolve_runtime_db_path
 from food_ai.food_bridge.ingredient_normalize import normalize_ingredient
 from food_ai.food_bridge.nutrition_bridge import lookup_ingredient_nutrition
 
@@ -19,6 +22,24 @@ NUTRIENT_KEYS = (
     "cholesterol_mg",
 )
 
+COMMON_INGREDIENT_SUGGESTIONS = (
+    "lasagna noodles",
+    "tomato sauce",
+    "ground beef",
+    "ricotta cheese",
+    "mozzarella cheese",
+    "parmesan cheese",
+    "olive oil",
+    "butter",
+    "egg",
+    "milk",
+    "flour",
+    "sugar",
+    "rice",
+    "chicken breast",
+    "cheddar cheese",
+)
+
 
 def _as_float(value: Any) -> float | None:
     if value in (None, "", "n/a"):
@@ -27,6 +48,115 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    row = connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row is not None
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    if not _table_exists(connection, table):
+        return set()
+    return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _append_suggestions(
+    *,
+    connection: sqlite3.Connection,
+    suggestions: dict[str, str],
+    table: str,
+    column: str,
+    query: str,
+    limit: int,
+) -> None:
+    if not _table_exists(connection, table) or column not in _table_columns(connection, table):
+        return
+    normalized_query = query.strip().lower()
+    if normalized_query:
+        rows = connection.execute(
+            f"""
+            SELECT DISTINCT {column} AS ingredient
+            FROM {table}
+            WHERE {column} IS NOT NULL
+              AND TRIM({column}) != ''
+              AND LOWER({column}) LIKE LOWER(?)
+            ORDER BY
+                CASE
+                    WHEN LOWER({column}) = LOWER(?) THEN 0
+                    WHEN LOWER({column}) LIKE LOWER(?) THEN 1
+                    ELSE 2
+                END,
+                LENGTH({column}),
+                {column}
+            LIMIT ?
+            """,
+            (f"%{normalized_query}%", normalized_query, f"{normalized_query}%", max(1, int(limit))),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            f"""
+            SELECT DISTINCT {column} AS ingredient
+            FROM {table}
+            WHERE {column} IS NOT NULL
+              AND TRIM({column}) != ''
+            ORDER BY LENGTH({column}), {column}
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+
+    for row in rows:
+        ingredient = str(row["ingredient"] if isinstance(row, sqlite3.Row) else row[0]).strip()
+        key = ingredient.lower()
+        if ingredient and key not in suggestions:
+            suggestions[key] = ingredient
+
+
+def load_ingredient_suggestions(
+    query: str = "",
+    *,
+    db_path: str | Path | None = None,
+    limit: int = 30,
+) -> list[str]:
+    clean_query = str(query or "").strip()
+    suggestions: dict[str, str] = {}
+
+    for ingredient in COMMON_INGREDIENT_SUGGESTIONS:
+        if not clean_query or clean_query.lower() in ingredient.lower():
+            suggestions[ingredient.lower()] = ingredient
+
+    database_path = resolve_runtime_db_path(db_path)
+    if not database_path.exists():
+        return list(suggestions.values())[: max(1, int(limit))]
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        for table, column in (
+            ("canonical_food_aliases", "alias_name"),
+            ("canonical_foods", "canonical_name"),
+            ("ingredient_aliases", "alias"),
+            ("ingredient_aliases", "canonical_ingredient"),
+            ("generic_ingredient_nutrition", "ingredient"),
+            ("generic_ingredient_nutrition", "normalized_ingredient"),
+            ("ingredient_nutrients", "ingredient"),
+            ("ingredient_nutrients", "normalized_ingredient"),
+            ("generic_foods", "food_name"),
+            ("generic_foods", "name"),
+            ("generic_foods", "description"),
+        ):
+            if len(suggestions) >= limit:
+                break
+            _append_suggestions(
+                connection=connection,
+                suggestions=suggestions,
+                table=table,
+                column=column,
+                query=clean_query,
+                limit=max(1, int(limit) - len(suggestions)),
+            )
+
+    return list(suggestions.values())[: max(1, int(limit))]
 
 
 def manual_ingredient_key(row: dict[str, Any] | str) -> str:
@@ -220,6 +350,7 @@ __all__ = [
     "apply_manual_ingredients_to_bridge_result",
     "build_manual_ingredient_bridge_rows",
     "clean_manual_ingredient_rows",
+    "load_ingredient_suggestions",
     "manual_exclusion_keys",
     "manual_ingredient_key",
 ]
