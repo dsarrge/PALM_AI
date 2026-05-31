@@ -12,6 +12,7 @@ from food_ai.food_bridge.nutrition_bridge import build_food_bridge
 from food_ai.food_bridge.usda_portions import audit_usda_portion_tables
 from food_ai.ui.config import UISettings
 from food_ai.ui.services.ingredient_candidate_service import clean_ingredient_candidates_for_nutrition
+from food_ai.ui.services.reviewed_meal_template_service import apply_reviewed_meal_template
 from food_ai.ui.services.runtime_service import get_runtime_diagnostics
 from food_ai.vision.predict_dish import predict_dish
 
@@ -40,11 +41,9 @@ class UIInferenceOptions:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-
 def get_smoke_test_image(settings: UISettings | None = None) -> Path | None:
     ui_settings = settings or UISettings()
     return ui_settings.sample_image_path if ui_settings.sample_image_path.exists() else None
-
 
 
 def run_food_inference(
@@ -118,6 +117,7 @@ def run_food_inference(
         result["warnings"] = sorted(set((result.get("warnings") or []) + preflight_warnings))
 
     result = clean_ingredient_candidates_for_nutrition(result, db_path=resolved_db_path)
+    result = apply_reviewed_meal_template(result, db_path=resolved_db_path)
     logger.info(
         "UI inference completed for %s with backend=%s",
         resolved_image_path,
