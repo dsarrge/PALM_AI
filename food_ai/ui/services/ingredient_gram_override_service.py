@@ -6,6 +6,11 @@ from typing import Any
 from food_ai.food_bridge.ingredient_normalize import normalize_ingredient
 
 
+PLAIN_STARCH_SODIUM_LIMIT_MG_PER_100G = 500.0
+PLAIN_STARCH_TOKENS = ("noodle", "noodles", "pasta", "spaghetti", "macaroni", "rice")
+PROCESSED_SALTY_TOKENS = ("sauce", "cheese", "sausage", "bacon", "ham", "pepperoni", "broth", "stock", "gravy")
+
+
 def _as_float(value: Any) -> float | None:
     if value in (None, "", "n/a"):
         return None
@@ -24,6 +29,31 @@ def ingredient_override_key(row: dict[str, Any] | str) -> str:
     return normalized.strip().lower()
 
 
+def _is_plain_starch(row: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(row.get(key) or "")
+        for key in ("ingredient", "matched_ingredient", "normalized_ingredient", "normalized")
+    )
+    key = normalize_ingredient(text) or text.lower()
+    return any(token in key for token in PLAIN_STARCH_TOKENS) and not any(token in key for token in PROCESSED_SALTY_TOKENS)
+
+
+def _sanitize_sodium_if_needed(row: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(row)
+    if not _is_plain_starch(updated):
+        return updated
+    nutrition = dict(updated.get("nutrition_per_100g") or {})
+    sodium = _as_float(nutrition.get("sodium_mg"))
+    if sodium is None or sodium <= PLAIN_STARCH_SODIUM_LIMIT_MG_PER_100G:
+        return updated
+    nutrition["sodium_mg"] = None
+    updated["nutrition_per_100g"] = nutrition
+    updated["sodium_guardrail_applied"] = True
+    updated["sodium_guardrail_reason"] = "plain_starch_implausible_sodium_match"
+    updated["sodium_guardrail_original_mg_per_100g"] = sodium
+    return updated
+
+
 def clean_gram_overrides(overrides: dict[str, Any] | None) -> dict[str, float]:
     cleaned: dict[str, float] = {}
     for key, value in (overrides or {}).items():
@@ -40,12 +70,11 @@ def _apply_to_row(row: dict[str, Any], overrides: dict[str, float]) -> tuple[dic
     updated = dict(row)
     key = ingredient_override_key(updated)
     if not key or key not in overrides:
-        return updated, None
+        return _sanitize_sodium_if_needed(updated), None
 
     new_grams = overrides[key]
     old_grams = _as_float(updated.get("grams_per_100g_dish") or updated.get("grams_default"))
-    if old_grams is not None and abs(old_grams - new_grams) < 0.0005:
-        return updated, None
+    changed = old_grams is None or abs(old_grams - new_grams) >= 0.0005
 
     updated["user_grams_override_applied"] = True
     updated["user_grams_override_original_grams_per_100g_dish"] = old_grams
@@ -54,6 +83,10 @@ def _apply_to_row(row: dict[str, Any], overrides: dict[str, float]) -> tuple[dic
     updated["contribution_basis"] = "ingredient_grams"
     updated["portion_method"] = "user_edited_grams_per_100g_dish"
     updated["weight_source"] = "user_edited_grams_per_100g_dish"
+    updated = _sanitize_sodium_if_needed(updated)
+
+    if not changed:
+        return updated, None
     return updated, {
         "ingredient": updated.get("ingredient"),
         "matched_ingredient": updated.get("matched_ingredient"),
@@ -82,10 +115,8 @@ def apply_gram_overrides_to_result(
 ) -> dict[str, Any]:
     cleaned_overrides = clean_gram_overrides(overrides)
     result = copy.deepcopy(inference_result)
-    if not cleaned_overrides:
-        return result
-
     all_audits: list[dict[str, Any]] = []
+
     for key in ("ingredients_ranked", "visible_ingredients"):
         rows = result.get(key) or []
         if isinstance(rows, list):
@@ -115,4 +146,9 @@ def apply_gram_overrides_to_result(
     return result
 
 
-__all__ = ["apply_gram_overrides_to_result", "clean_gram_overrides", "ingredient_override_key"]
+__all__ = [
+    "PLAIN_STARCH_SODIUM_LIMIT_MG_PER_100G",
+    "apply_gram_overrides_to_result",
+    "clean_gram_overrides",
+    "ingredient_override_key",
+]
