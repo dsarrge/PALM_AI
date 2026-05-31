@@ -22,6 +22,10 @@ from food_ai.ui.components.upload_panel import render_image_preview, render_uplo
 from food_ai.ui.config import UISettings
 from food_ai.ui.services.formatters import format_result_for_ui
 from food_ai.ui.services.inference_service import UIInferenceOptions, run_food_inference
+from food_ai.ui.services.manual_ingredient_service import (
+    apply_manual_ingredients_to_bridge_result,
+    manual_exclusion_keys,
+)
 from food_ai.ui.services.meal_log_service import list_recent_meal_logs, save_meal_log
 from food_ai.ui.services.runtime_service import format_runtime_status_for_ui, get_runtime_diagnostics
 from food_ai.ui.utils.file_io import ensure_directory, file_digest, save_uploaded_file
@@ -85,6 +89,7 @@ def _handle_image_selection(artifacts_root: Path) -> None:
     st.session_state["uploaded_image_name"] = uploaded_file.name
     st.session_state["uploaded_image_digest"] = saved_digest
     st.session_state["loaded_sample_case"] = None
+    st.session_state["manual_ingredients"] = []
     clear_inference_state(st.session_state)
     st.session_state["status_message"] = f"Loaded image: {uploaded_file.name}"
 
@@ -105,46 +110,68 @@ def _run_inference(options: UIInferenceOptions, db_path: Path) -> None:
     st.session_state["nutrition_recalc_result"] = None
     st.session_state["formatted_result"] = formatted
     st.session_state["excluded_ingredients"] = []
+    st.session_state["manual_ingredients"] = []
     st.session_state["last_inference_id"] = st.session_state.get("uploaded_image_digest") or options.fingerprint()
     st.session_state["last_options_fingerprint"] = options.fingerprint()
     st.session_state["last_error"] = None
     st.session_state["status_message"] = "Meal analyzed. Review ingredients and save the log when ready."
 
 
-def _recalculate_nutrition() -> bool:
+def _selected_exclusion_keys() -> list[str]:
+    return list(dict.fromkeys((st.session_state.get("excluded_ingredients") or []) + manual_exclusion_keys(st.session_state.get("manual_ingredients") or [])))
+
+
+def _result_with_manual_ingredients(db_path: Path) -> dict:
     base_result = st.session_state.get("base_inference_result") or st.session_state.get("inference_result")
     if not base_result:
+        raise ValueError("Analyze a meal before applying manual ingredients.")
+    return apply_manual_ingredients_to_bridge_result(
+        base_result,
+        st.session_state.get("manual_ingredients") or [],
+        db_path=db_path,
+    )
+
+
+def _recalculate_nutrition(db_path: Path) -> bool:
+    if not (st.session_state.get("base_inference_result") or st.session_state.get("inference_result")):
         st.warning("Analyze a meal before recalculating nutrition.")
         return False
 
-    excluded = st.session_state.get("excluded_ingredients") or []
-    ranked = (st.session_state.get("formatted_result") or {}).get("ingredients", {}).get("ranked") or []
+    merged_result = _result_with_manual_ingredients(db_path)
+    excluded = _selected_exclusion_keys()
+    ranked = merged_result.get("ingredients_ranked") or []
     included_count = len(
         [
             row
             for row in ranked
-            if str(row.get("normalized_ingredient") or row.get("ingredient") or "").strip().lower() not in set(excluded)
+            if str(row.get("normalized_ingredient") or row.get("normalized") or row.get("ingredient") or "").strip().lower() not in set(excluded)
         ]
     )
     if included_count <= 0:
         st.warning("Select at least one ingredient to calculate nutrition.")
         return False
 
-    recalculated = recalculate_bridge_nutrition(base_result, excluded)
+    recalculated = recalculate_bridge_nutrition(merged_result, excluded)
     formatted = format_result_for_ui(recalculated)
     st.session_state["nutrition_recalc_result"] = recalculated
     st.session_state["inference_result"] = recalculated
     st.session_state["formatted_result"] = formatted
-    st.session_state["status_message"] = "Nutrition recalculated from selected ingredients."
+    st.session_state["status_message"] = "Nutrition recalculated from selected and manually added ingredients."
     return True
 
 
 def _save_current_meal(form_state: dict[str, object], db_path: Path) -> None:
-    formatted = st.session_state.get("formatted_result")
-    inference_result = st.session_state.get("inference_result")
-    if not formatted or not inference_result:
+    if not st.session_state.get("formatted_result") or not st.session_state.get("inference_result"):
         st.warning("Analyze a meal before saving.")
         return
+
+    # Always apply the latest include/exclude edits and manually added ingredients before persisting.
+    if _recalculate_nutrition(db_path):
+        formatted = st.session_state["formatted_result"]
+        inference_result = st.session_state["inference_result"]
+    else:
+        formatted = st.session_state.get("formatted_result")
+        inference_result = st.session_state.get("inference_result")
 
     record = save_meal_log(
         image_path=st.session_state.get("uploaded_image_path"),
@@ -154,7 +181,7 @@ def _save_current_meal(form_state: dict[str, object], db_path: Path) -> None:
         notes=str(form_state.get("notes") or ""),
         user_label=str(form_state.get("user_label") or ""),
         eaten_at=str(form_state.get("eaten_at") or ""),
-        excluded_ingredients=st.session_state.get("excluded_ingredients") or [],
+        excluded_ingredients=_selected_exclusion_keys(),
         db_path=db_path,
     )
     st.session_state["status_message"] = (
@@ -213,10 +240,14 @@ def main() -> None:
         if st.session_state.get("show_pipeline_status"):
             render_status_panel(formatted)
 
-        render_ingredients_panel(formatted)
+        render_ingredients_panel(formatted, allow_manual_ingredients=True)
         if st.button("Recalculate Nutrition From Selected Ingredients", width="stretch"):
-            if _recalculate_nutrition():
-                st.rerun()
+            try:
+                if _recalculate_nutrition(db_path):
+                    st.rerun()
+            except Exception as exc:  # pragma: no cover - Streamlit-only path
+                logger.exception("Production UI nutrition recalculation failed")
+                st.error(f"Could not recalculate nutrition: {exc}")
 
         render_nutrition_panel(formatted)
 
