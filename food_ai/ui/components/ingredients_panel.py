@@ -5,6 +5,7 @@ from typing import Any
 
 import streamlit as st
 
+from food_ai.ui.services.ingredient_gram_override_service import ingredient_override_key
 from food_ai.ui.services.manual_ingredient_service import load_ingredient_suggestions
 
 
@@ -46,6 +47,15 @@ def _ingredient_key(row: dict) -> str:
 
 def _manual_key(row: dict[str, Any]) -> str:
     return str(row.get("ingredient") or "").strip().lower()
+
+
+def _as_float(value: Any) -> float | None:
+    if value in (None, "", "n/a"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _render_table(title: str, rows: list[dict]) -> None:
@@ -208,12 +218,16 @@ def render_ingredients_panel(
         st.info("No blended ingredient ranking available.")
     else:
         excluded = set(st.session_state.get("excluded_ingredients") or [])
+        current_overrides = dict(st.session_state.get("ingredient_gram_overrides") or {})
         rows = []
         for row in ranked:
             item = dict(row)
             key = _ingredient_key(item)
+            override_key = ingredient_override_key(item)
             default_include = bool(item.get("include_in_nutrition", True))
             item["include_in_nutrition"] = default_include and key not in excluded
+            if override_key in current_overrides:
+                item["grams_per_100g_dish"] = current_overrides[override_key]
             rows.append(item)
         editor_key = f"ingredient_inclusion_editor_{st.session_state.get('last_inference_id') or 'current'}"
         edited_rows = st.data_editor(
@@ -229,7 +243,6 @@ def render_ingredients_panel(
                 "status",
                 "weight",
                 "grams_default",
-                "grams_per_100g_dish",
                 "portion_method",
                 "weight_source",
                 "source_count",
@@ -252,7 +265,14 @@ def render_ingredients_panel(
                 "status": "Status",
                 "weight": "Weight",
                 "grams_default": "Default Grams",
-                "grams_per_100g_dish": "Grams / 100g Dish",
+                "grams_per_100g_dish": st.column_config.NumberColumn(
+                    "Grams / 100g Dish",
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=1.0,
+                    format="%.1f",
+                    help="Edit this, then click Recalculate Nutrition From Selected Ingredients.",
+                ),
                 "portion_method": "Portion Method",
                 "weight_source": "Weight Source",
                 "source_count": "Source Count",
@@ -276,6 +296,13 @@ def render_ingredients_panel(
             for row in edited_rows
             if not row.get("include_in_nutrition") and _ingredient_key(row)
         ]
+        gram_overrides: dict[str, float] = {}
+        for row in edited_rows:
+            override_key = ingredient_override_key(row)
+            edited_grams = _as_float(row.get("grams_per_100g_dish"))
+            if override_key and edited_grams is not None:
+                gram_overrides[override_key] = round(float(edited_grams), 3)
+        st.session_state["ingredient_gram_overrides"] = gram_overrides
 
     if allow_manual_ingredients:
         _render_manual_ingredient_editor(db_path=db_path)
