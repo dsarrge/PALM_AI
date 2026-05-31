@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 import logging
 import sys
+from typing import Any
 
 import streamlit as st
 
@@ -12,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from food_ai.config import resolve_runtime_db_path
+from food_ai.food_bridge.ingredient_normalize import normalize_ingredient
 from food_ai.food_bridge.nutrition_bridge import recalculate_bridge_nutrition
 from food_ai.ui.components.ingredients_panel import render_ingredients_panel
 from food_ai.ui.components.meal_log_panel import render_meal_log_form, render_recent_meal_logs
@@ -92,6 +94,59 @@ def _sidebar_controls(settings: UISettings) -> tuple[UIInferenceOptions, Path, P
     return options, artifact_root, db_path, weight_policy
 
 
+def _ingredient_key(row_or_text: dict[str, Any] | str) -> str:
+    if isinstance(row_or_text, str):
+        value = row_or_text
+    else:
+        value = (
+            row_or_text.get("normalized")
+            or row_or_text.get("normalized_ingredient")
+            or row_or_text.get("matched_ingredient")
+            or row_or_text.get("canonical")
+            or row_or_text.get("raw_ingredient")
+            or row_or_text.get("ingredient")
+            or ""
+        )
+    return normalize_ingredient(str(value)) or str(value).strip().lower()
+
+
+def _already_excluded_ingredient_keys(result: dict[str, Any]) -> list[str]:
+    excluded: list[str] = []
+    row_groups: list[Any] = [
+        result.get("ingredients_ranked") or [],
+        result.get("visible_ingredients") or [],
+    ]
+    palm_ready = result.get("palm_ready") or {}
+    row_groups.extend(
+        [
+            palm_ready.get("matched_ingredients") or [],
+            palm_ready.get("unmatched_ingredients") or [],
+        ]
+    )
+    for rows in row_groups:
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("included_in_nutrition") is False or row.get("include_in_nutrition") is False:
+                key = _ingredient_key(row)
+                if key:
+                    excluded.append(key)
+    return list(dict.fromkeys(excluded))
+
+
+def _combined_exclusions(result: dict[str, Any], user_exclusions: list[str] | None = None) -> list[str]:
+    return list(dict.fromkeys(_already_excluded_ingredient_keys(result) + list(user_exclusions or [])))
+
+
+def _row_is_included(row: dict[str, Any], excluded: set[str]) -> bool:
+    if row.get("included_in_nutrition") is False or row.get("include_in_nutrition") is False:
+        return False
+    key = _ingredient_key(row)
+    return not (key and key in excluded)
+
+
 def _handle_image_selection(artifacts_root: Path) -> None:
     upload_state = render_upload_panel()
     uploads_dir = ensure_directory(artifacts_root / "meal_uploads")
@@ -125,13 +180,14 @@ def _run_inference(options: UIInferenceOptions, db_path: Path, weight_policy: st
     )
     st.session_state["raw_inference_result"] = raw_result
     guarded_result = apply_ingredient_weight_guardrails(raw_result, policy=weight_policy)
-    recalculated = recalculate_bridge_nutrition(guarded_result, [])
+    excluded = _combined_exclusions(guarded_result)
+    recalculated = recalculate_bridge_nutrition(guarded_result, excluded)
     formatted = format_result_for_ui(recalculated)
     st.session_state["inference_result"] = recalculated
     st.session_state["base_inference_result"] = recalculated
     st.session_state["nutrition_recalc_result"] = None
     st.session_state["formatted_result"] = formatted
-    st.session_state["excluded_ingredients"] = []
+    st.session_state["excluded_ingredients"] = excluded
     st.session_state["manual_ingredients"] = []
     st.session_state["last_inference_id"] = st.session_state.get("uploaded_image_digest") or options.fingerprint()
     st.session_state["last_options_fingerprint"] = options.fingerprint()
@@ -161,15 +217,9 @@ def _recalculate_nutrition(db_path: Path, weight_policy: str) -> bool:
 
     merged_result = _result_with_manual_ingredients(db_path)
     guarded_result = apply_ingredient_weight_guardrails(merged_result, policy=weight_policy)
-    excluded = _selected_exclusion_keys()
+    excluded = _combined_exclusions(guarded_result, _selected_exclusion_keys())
     ranked = guarded_result.get("ingredients_ranked") or []
-    included_count = len(
-        [
-            row
-            for row in ranked
-            if str(row.get("normalized_ingredient") or row.get("normalized") or row.get("ingredient") or "").strip().lower() not in set(excluded)
-        ]
-    )
+    included_count = len([row for row in ranked if isinstance(row, dict) and _row_is_included(row, set(excluded))])
     if included_count <= 0:
         st.warning("Select at least one ingredient to calculate nutrition.")
         return False
@@ -179,6 +229,7 @@ def _recalculate_nutrition(db_path: Path, weight_policy: str) -> bool:
     st.session_state["nutrition_recalc_result"] = recalculated
     st.session_state["inference_result"] = recalculated
     st.session_state["formatted_result"] = formatted
+    st.session_state["excluded_ingredients"] = excluded
     st.session_state["status_message"] = f"Nutrition recalculated with ingredient weight policy: {weight_policy}."
     return True
 
