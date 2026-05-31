@@ -105,9 +105,7 @@ def _add_manual_ingredient(ingredient: str, grams_per_100g_dish: float) -> None:
     else:
         rows[existing_index] = new_row
     st.session_state["manual_ingredients"] = rows
-    st.session_state["manual_ingredient_query"] = ""
-    st.session_state["manual_ingredient_custom"] = ""
-    st.session_state["manual_ingredient_selected"] = ""
+    st.session_state["manual_ingredient_notice"] = f"Added {ingredient_text}."
 
 
 def _render_manual_ingredient_editor(db_path: str | Path | None = None) -> None:
@@ -116,6 +114,10 @@ def _render_manual_ingredient_editor(db_path: str | Path | None = None) -> None:
         "Start typing to filter existing PALM ingredients, choose the closest match, enter grams per 100g dish, then add it. "
         "Use custom text only when the ingredient is not in the suggestions."
     )
+    notice = st.session_state.get("manual_ingredient_notice")
+    if notice:
+        st.success(str(notice))
+        st.session_state["manual_ingredient_notice"] = None
 
     query_col, select_col, grams_col, add_col = st.columns([1.3, 1.7, 0.8, 0.7], gap="small")
     with query_col:
