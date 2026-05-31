@@ -1,8 +1,8 @@
-# PALM Streamlit Tester
+# PALM Streamlit UIs
 
-Local desktop testing UI for the PALM food classifier and food bridge.
+Local desktop Streamlit UIs for the PALM food classifier and food bridge.
 
-## What this tester actually uses
+## Diagnostic Tester
 
 The maintained test flow is:
 
@@ -14,11 +14,9 @@ The maintained test flow is:
 - `artifacts/food_bridge/dish_priors.json`
 - `shared/palm.db` table `generic_ingredient_nutrition`
 
-The UI is diagnostic and read-only for inference. It does not write to the PALM DB during image inference.
+The tester is diagnostic infrastructure. It can write local JSON test artifacts under `artifacts/ui/test_logs/`, but it does not write reviewed meal logs to the PALM DB.
 
-## Launch from palm-gpu311
-
-Use the intended GPU-enabled environment instead of the system Python:
+Launch the tester from the intended GPU-enabled environment:
 
 ```bash
 conda activate palm-gpu311
@@ -26,26 +24,51 @@ python -c "from food_ai.runtime_diagnostics import get_runtime_diagnostics; impo
 python -m streamlit run C:/PALM/food_ai/ui/app.py
 ```
 
+## Production Meal Logger
+
+The production UI lives at `food_ai/ui/production_app.py`.
+
+It reuses the same upload, inference, ingredient editor, nutrition panel, runtime diagnostics, and file utilities as the tester, but adds a DB-backed meal logging workflow through `food_ai/ui/services/meal_log_service.py`.
+
+Launch it with:
+
+```bash
+python -m streamlit run C:/PALM/food_ai/ui/production_app.py
+```
+
+On the Windows PALM workstation, use:
+
+```bash
+launchers/run_palm_meal_logger.bat
+```
+
+The production app creates the `meal_logs` table on demand in the selected SQLite database. By default, that is `shared/PALM_V2.db` when present, otherwise `shared/palm.db`.
+
+Each saved meal row includes:
+
+- image path
+- created and optional eaten timestamps
+- corrected dish name
+- confidence
+- serving weight in grams
+- scaled calories and nutrient totals
+- per-100g nutrition JSON
+- included and excluded ingredient JSON
+- notes
+- raw inference payload JSON
+
 ## Build food bridge priors
 
-RecipeNLG is used offline to build dish-to-ingredient priors. The UI does not scan RecipeNLG at inference time.
+RecipeNLG is used offline to build dish-to-ingredient priors. The UIs do not scan RecipeNLG at inference time.
 
 ```bash
 python -m food_ai.food_bridge.build_dish_priors
 python -m food_ai.food_bridge.nutrition_bridge --dish pizza --confidence 0.85
 ```
 
-## What the UI writes locally
+## Recommended manual tester cases
 
-Inference stays read-only, but the tester may write local artifacts under `artifacts/ui/`:
-
-- uploaded or copied sample images: `artifacts/ui/uploads/`
-- optional saved test logs: `artifacts/ui/test_logs/`
-- optional run reports: `artifacts/ui/run_reports/`
-
-## Recommended manual cases
-
-Use the built-in sample panel and try at least these:
+Use the built-in sample panel in `app.py` and try at least these:
 
 - `Waffles With Berries`: clean baseline plated-food case
 - `Breakfast Sandwich Close Crop`: difficult crop / partial-food case
@@ -55,20 +78,9 @@ Use the built-in sample panel and try at least these:
 - `Empty Table Setting`: non-food graceful-failure check
 - `Texture Noise`: hard non-food failure check
 
-## What to inspect
-
-For each run, inspect:
-
-- stage 1 input image preview
-- stage 2 pipeline status labels and warnings
-- stage 3 dish classifier candidates and final dish
-- stage 4 dish-prior ingredient ranking and USDA-backed normalization
-- stage 5 estimated nutrition per 100g from dish ingredient priors
-- stage 6 raw JSON, missing artifacts, bridge status, and runtime diagnostics
-
 ## Notes on current behavior
 
 - there is no dedicated food / non-food gate in the current maintained pipeline, so the UI surfaces that explicitly
 - if classifier checkpoints are missing, the app shows the classifier error instead of hiding it
 - if `dish_priors.json` is missing, the nutrition bridge returns a pending status with the build command
-- nutrition output is an ingredient-prior estimate per 100g, not a final portion-estimated plated meal result
+- nutrition output is an ingredient-prior estimate per 100g before the production app scales it to the user-entered serving size
