@@ -11,6 +11,7 @@ from food_ai.config import resolve_runtime_db_path
 from food_ai.food_bridge.nutrition_bridge import build_food_bridge
 from food_ai.food_bridge.usda_portions import audit_usda_portion_tables
 from food_ai.ui.config import UISettings
+from food_ai.ui.services.ingredient_candidate_service import clean_ingredient_candidates_for_nutrition
 from food_ai.ui.services.runtime_service import get_runtime_diagnostics
 from food_ai.vision.predict_dish import predict_dish
 
@@ -115,6 +116,8 @@ def run_food_inference(
     }
     if preflight_warnings:
         result["warnings"] = sorted(set((result.get("warnings") or []) + preflight_warnings))
+
+    result = clean_ingredient_candidates_for_nutrition(result, db_path=resolved_db_path)
     logger.info(
         "UI inference completed for %s with backend=%s",
         resolved_image_path,
