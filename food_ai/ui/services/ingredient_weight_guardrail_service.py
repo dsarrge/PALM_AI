@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from food_ai.ui.services.ingredient_gram_override_service import apply_gram_overrides_to_result
+
 
 DEFAULT_INGREDIENT_WEIGHT_POLICY = "mode"
 DEFAULT_STD_GUARDRAIL_THRESHOLD_G = 12.5
@@ -18,6 +20,17 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _ui_gram_edits() -> dict[str, Any]:
+    try:
+        import streamlit as st
+    except Exception:
+        return {}
+    try:
+        return dict(st.session_state.get("ingredient_gram_overrides") or {})
+    except Exception:
+        return {}
 
 
 def _row_metrics(row: dict[str, Any]) -> dict[str, float | None]:
@@ -60,7 +73,6 @@ def _select_grams(
     mean_g = metrics["mean"]
     mode_g = metrics["mode"]
     std_g = metrics["std"]
-
     if policy == "mean":
         return (mean_g, "mean_grams_per_100g_dish", "policy_mean") if mean_g and mean_g > 0.0 else (None, None, None)
     if policy == "mode":
@@ -99,12 +111,10 @@ def _apply_policy_to_row(
     if selected_g is None or selected_metric is None or reason is None:
         updated["ingredient_weight_policy"] = policy
         return updated, None
-
     current_g = metrics["current"]
     if current_g is not None and abs(current_g - selected_g) < 0.0005:
         updated["ingredient_weight_policy"] = policy
         return updated, None
-
     updated["grams_per_100g_dish"] = round(selected_g, 6)
     updated["grams_default"] = round(selected_g, 6)
     updated["ingredient_weight_policy"] = policy
@@ -114,7 +124,6 @@ def _apply_policy_to_row(
     updated["weight_guardrail_selected_metric"] = selected_metric
     if "portion_method" in updated:
         updated["portion_method"] = f"{updated.get('portion_method')}_{policy}"
-
     return updated, {
         "ingredient": updated.get("ingredient") or updated.get("matched_ingredient"),
         "matched_ingredient": updated.get("matched_ingredient"),
@@ -151,7 +160,6 @@ def apply_ingredient_weight_guardrails(
 ) -> dict[str, Any]:
     if policy not in SUPPORTED_INGREDIENT_WEIGHT_POLICIES:
         raise ValueError("Unsupported ingredient weight policy: " + str(policy))
-
     result = copy.deepcopy(inference_result)
     all_audits: list[dict[str, Any]] = []
     kwargs = {
@@ -160,25 +168,21 @@ def apply_ingredient_weight_guardrails(
         "fallback_delta_g": fallback_delta_g,
         "fallback_ratio": fallback_ratio,
     }
-
     for key in ("ingredients_ranked", "visible_ingredients"):
         rows = result.get(key) or []
         if isinstance(rows, list):
             result[key], audits = _apply_to_rows(rows, **kwargs)
             all_audits.extend(audits)
-
     palm_ready = dict(result.get("palm_ready") or {})
     for key in ("matched_ingredients", "unmatched_ingredients"):
         rows = palm_ready.get(key) or []
         if isinstance(rows, list):
             palm_ready[key], audits = _apply_to_rows(rows, **kwargs)
             all_audits.extend(audits)
-
     deduped = {}
     for audit in all_audits:
         key = (str(audit.get("ingredient") or audit.get("matched_ingredient") or ""), audit.get("selected_metric"))
         deduped[key] = audit
-
     palm_ready["ingredient_weight_policy"] = {
         "policy": policy,
         "applied_count": len(deduped),
@@ -191,8 +195,10 @@ def apply_ingredient_weight_guardrails(
         warnings = list(result.get("warnings") or [])
         warnings.append(f"ingredient_weight_policy_applied:{policy}")
         result["warnings"] = list(dict.fromkeys(warnings))
-
     result["palm_ready"] = palm_ready
+    gram_edits = _ui_gram_edits()
+    if gram_edits:
+        result = apply_gram_overrides_to_result(result, gram_edits)
     return result
 
 
