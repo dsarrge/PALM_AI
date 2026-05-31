@@ -22,6 +22,7 @@ from food_ai.ui.components.upload_panel import render_image_preview, render_uplo
 from food_ai.ui.config import UISettings
 from food_ai.ui.services.formatters import format_result_for_ui
 from food_ai.ui.services.inference_service import UIInferenceOptions, run_food_inference
+from food_ai.ui.services.ingredient_weight_guardrail_service import apply_ingredient_weight_guardrails
 from food_ai.ui.services.manual_ingredient_service import (
     apply_manual_ingredients_to_bridge_result,
     manual_exclusion_keys,
@@ -99,14 +100,16 @@ def _run_inference(options: UIInferenceOptions, db_path: Path) -> None:
         st.warning("Upload a meal image before analyzing.")
         return
 
-    result = run_food_inference(
+    raw_result = run_food_inference(
         image_path=st.session_state["uploaded_image_path"],
         options=options,
         db_path=db_path,
     )
-    formatted = format_result_for_ui(result)
-    st.session_state["inference_result"] = result
-    st.session_state["base_inference_result"] = result
+    guarded_result = apply_ingredient_weight_guardrails(raw_result)
+    recalculated = recalculate_bridge_nutrition(guarded_result, [])
+    formatted = format_result_for_ui(recalculated)
+    st.session_state["inference_result"] = recalculated
+    st.session_state["base_inference_result"] = recalculated
     st.session_state["nutrition_recalc_result"] = None
     st.session_state["formatted_result"] = formatted
     st.session_state["excluded_ingredients"] = []
@@ -114,7 +117,7 @@ def _run_inference(options: UIInferenceOptions, db_path: Path) -> None:
     st.session_state["last_inference_id"] = st.session_state.get("uploaded_image_digest") or options.fingerprint()
     st.session_state["last_options_fingerprint"] = options.fingerprint()
     st.session_state["last_error"] = None
-    st.session_state["status_message"] = "Meal analyzed. Review ingredients and save the log when ready."
+    st.session_state["status_message"] = "Meal analyzed with ingredient weight guardrails. Review ingredients and save the log when ready."
 
 
 def _selected_exclusion_keys() -> list[str]:
@@ -138,8 +141,9 @@ def _recalculate_nutrition(db_path: Path) -> bool:
         return False
 
     merged_result = _result_with_manual_ingredients(db_path)
+    guarded_result = apply_ingredient_weight_guardrails(merged_result)
     excluded = _selected_exclusion_keys()
-    ranked = merged_result.get("ingredients_ranked") or []
+    ranked = guarded_result.get("ingredients_ranked") or []
     included_count = len(
         [
             row
@@ -151,7 +155,7 @@ def _recalculate_nutrition(db_path: Path) -> bool:
         st.warning("Select at least one ingredient to calculate nutrition.")
         return False
 
-    recalculated = recalculate_bridge_nutrition(merged_result, excluded)
+    recalculated = recalculate_bridge_nutrition(guarded_result, excluded)
     formatted = format_result_for_ui(recalculated)
     st.session_state["nutrition_recalc_result"] = recalculated
     st.session_state["inference_result"] = recalculated
