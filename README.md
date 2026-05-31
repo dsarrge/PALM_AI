@@ -163,6 +163,7 @@ Current targeted regression suite:
 
 ```bash
 conda run -n palm-gpu311 python -m unittest food_ai.tests.test_refactor_core
+conda run -n palm-gpu311 python -m unittest food_ai.tests.test_meal_log_service
 ```
 
 ## Notes
@@ -170,8 +171,6 @@ conda run -n palm-gpu311 python -m unittest food_ai.tests.test_refactor_core
 - Runtime dependencies visible in the code include `pandas`, `requests`, `tqdm`, `sentence-transformers`, and `torch`.
 - Large USDA and recipe assets live in `food_ai/data/`; the embedding cache is stored at `food_ai/data/usda_embeddings.pkl`.
 - `scripts/run_barcode.py` and `scripts/run_food_ai.py` predate the refactor and should be treated as legacy until they are brought in line with the current package layout.
-
-
 
 
 
@@ -197,3 +196,21 @@ This Streamlit UI is test-only infrastructure for local validation. It is intend
 - PC Streamlit tester -> current local service layer
 - Jetson appliance -> future backend API layer
 - mobile client -> future frontend consuming the same backend contract
+
+## Production Meal Logger
+
+A cleaner Streamlit meal logging UI is available at `food_ai/ui/production_app.py`. It reuses the maintained upload, inference, ingredient, nutrition, and runtime services, but writes reviewed meal logs to SQLite instead of local JSON test artifacts.
+
+Launch it with:
+
+```bash
+streamlit run food_ai/ui/production_app.py
+```
+
+On the Windows PALM workstation, use:
+
+```bash
+launchers/run_palm_meal_logger.bat
+```
+
+The production app creates a `meal_logs` table on demand in the selected PALM database. By default that database is `shared/PALM_V2.db` when present, otherwise `shared/palm.db`. The saved row includes the image path, corrected dish name, confidence, serving grams, scaled nutrition totals, included/excluded ingredient JSON, notes, and the raw inference payload for traceability.

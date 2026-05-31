@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+import logging
+import sys
+
+import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from food_ai.config import resolve_runtime_db_path
+from food_ai.food_bridge.nutrition_bridge import recalculate_bridge_nutrition
+from food_ai.ui.components.ingredients_panel import render_ingredients_panel
+from food_ai.ui.components.meal_log_panel import render_meal_log_form, render_recent_meal_logs
+from food_ai.ui.components.nutrition_panel import render_nutrition_panel
+from food_ai.ui.components.results_summary import render_results_summary
+from food_ai.ui.components.status_panel import render_status_panel
+from food_ai.ui.components.upload_panel import render_image_preview, render_upload_panel
+from food_ai.ui.config import UISettings
+from food_ai.ui.services.formatters import format_result_for_ui
+from food_ai.ui.services.inference_service import UIInferenceOptions, run_food_inference
+from food_ai.ui.services.meal_log_service import list_recent_meal_logs, save_meal_log
+from food_ai.ui.services.runtime_service import format_runtime_status_for_ui, get_runtime_diagnostics
+from food_ai.ui.utils.file_io import ensure_directory, file_digest, save_uploaded_file
+from food_ai.ui.utils.session import clear_inference_state, ensure_session_state
+
+logger = logging.getLogger(__name__)
+
+
+def _sidebar_controls(settings: UISettings) -> tuple[UIInferenceOptions, Path, Path]:
+    st.sidebar.header("Production Settings")
+    artifact_root = Path(
+        st.sidebar.text_input(
+            "Local artifact folder",
+            value=str(settings.logs_dir.parent),
+            help="Uploaded meal photos and run reports are stored locally. Meal logs are written to the PALM SQLite database.",
+        )
+    )
+    db_path = Path(
+        st.sidebar.text_input(
+            "Meal log database",
+            value=str(resolve_runtime_db_path()),
+            help="Defaults to shared/PALM_V2.db when present, otherwise shared/palm.db.",
+        )
+    )
+    top_k_dishes = st.sidebar.slider("Dish candidates", min_value=3, max_value=10, value=5)
+    show_pipeline_status = st.sidebar.checkbox("Show pipeline status", value=False)
+
+    options = UIInferenceOptions(
+        top_k_dishes=top_k_dishes,
+        top_k_recipes=8,
+        top_k_ingredients=20,
+        show_debug=False,
+        enable_segmentation=False,
+        prefer_calibrated_probabilities=True,
+        enable_embedding_cache=True,
+        save_run_report=True,
+        run_report_dir=artifact_root / "run_reports",
+        use_dish_mass_priors=True,
+        use_nutrition5k=False,
+        local_files_only=True,
+        developer_mode=False,
+    )
+    st.session_state["prod_db_path"] = str(db_path)
+    st.session_state["show_pipeline_status"] = show_pipeline_status
+    return options, artifact_root, db_path
+
+
+def _handle_image_selection(artifacts_root: Path) -> None:
+    upload_state = render_upload_panel()
+    uploads_dir = ensure_directory(artifacts_root / "meal_uploads")
+    uploaded_file = upload_state["uploaded_file"]
+    if uploaded_file is None:
+        return
+
+    digest = file_digest(uploaded_file.getvalue())
+    if digest == st.session_state.get("uploaded_image_digest"):
+        return
+
+    saved_path, saved_digest = save_uploaded_file(uploaded_file, uploads_dir)
+    st.session_state["uploaded_image_path"] = str(saved_path)
+    st.session_state["uploaded_image_name"] = uploaded_file.name
+    st.session_state["uploaded_image_digest"] = saved_digest
+    st.session_state["loaded_sample_case"] = None
+    clear_inference_state(st.session_state)
+    st.session_state["status_message"] = f"Loaded image: {uploaded_file.name}"
+
+
+def _run_inference(options: UIInferenceOptions, db_path: Path) -> None:
+    if not st.session_state.get("uploaded_image_path"):
+        st.warning("Upload a meal image before analyzing.")
+        return
+
+    result = run_food_inference(
+        image_path=st.session_state["uploaded_image_path"],
+        options=options,
+        db_path=db_path,
+    )
+    formatted = format_result_for_ui(result)
+    st.session_state["inference_result"] = result
+    st.session_state["base_inference_result"] = result
+    st.session_state["nutrition_recalc_result"] = None
+    st.session_state["formatted_result"] = formatted
+    st.session_state["excluded_ingredients"] = []
+    st.session_state["last_inference_id"] = st.session_state.get("uploaded_image_digest") or options.fingerprint()
+    st.session_state["last_options_fingerprint"] = options.fingerprint()
+    st.session_state["last_error"] = None
+    st.session_state["status_message"] = "Meal analyzed. Review ingredients and save the log when ready."
+
+
+def _recalculate_nutrition() -> bool:
+    base_result = st.session_state.get("base_inference_result") or st.session_state.get("inference_result")
+    if not base_result:
+        st.warning("Analyze a meal before recalculating nutrition.")
+        return False
+
+    excluded = st.session_state.get("excluded_ingredients") or []
+    ranked = (st.session_state.get("formatted_result") or {}).get("ingredients", {}).get("ranked") or []
+    included_count = len(
+        [
+            row
+            for row in ranked
+            if str(row.get("normalized_ingredient") or row.get("ingredient") or "").strip().lower() not in set(excluded)
+        ]
+    )
+    if included_count <= 0:
+        st.warning("Select at least one ingredient to calculate nutrition.")
+        return False
+
+    recalculated = recalculate_bridge_nutrition(base_result, excluded)
+    formatted = format_result_for_ui(recalculated)
+    st.session_state["nutrition_recalc_result"] = recalculated
+    st.session_state["inference_result"] = recalculated
+    st.session_state["formatted_result"] = formatted
+    st.session_state["status_message"] = "Nutrition recalculated from selected ingredients."
+    return True
+
+
+def _save_current_meal(form_state: dict[str, object], db_path: Path) -> None:
+    formatted = st.session_state.get("formatted_result")
+    inference_result = st.session_state.get("inference_result")
+    if not formatted or not inference_result:
+        st.warning("Analyze a meal before saving.")
+        return
+
+    record = save_meal_log(
+        image_path=st.session_state.get("uploaded_image_path"),
+        inference_result=inference_result,
+        formatted_result=formatted,
+        serving_weight_g=float(form_state["serving_weight_g"]),
+        notes=str(form_state.get("notes") or ""),
+        user_label=str(form_state.get("user_label") or ""),
+        eaten_at=str(form_state.get("eaten_at") or ""),
+        excluded_ingredients=st.session_state.get("excluded_ingredients") or [],
+        db_path=db_path,
+    )
+    st.session_state["status_message"] = (
+        f"Saved meal log: {record.dish_name} | {record.serving_weight_g:g}g | "
+        f"{record.calories if record.calories is not None else 'n/a'} calories"
+    )
+
+
+def main() -> None:
+    st.set_page_config(page_title="PALM Meal Logger", layout="wide")
+    settings = UISettings()
+    ensure_session_state(st.session_state)
+
+    runtime_diagnostics = get_runtime_diagnostics(settings.expected_env_name)
+    runtime_status = format_runtime_status_for_ui(runtime_diagnostics)
+
+    st.title("PALM Meal Logger")
+    st.caption("Production Streamlit UI for analyzing meal photos and saving reviewed meal logs to the local PALM database.")
+
+    if runtime_status.get("degraded"):
+        st.warning("Runtime is degraded. Meal logging still works, but some inference components may be unavailable.")
+
+    options, artifacts_root, db_path = _sidebar_controls(settings)
+    _handle_image_selection(artifacts_root)
+
+    status_message = st.session_state.get("status_message")
+    if status_message:
+        st.success(status_message)
+        st.session_state["status_message"] = None
+
+    input_col, results_col = st.columns([1, 2], gap="large")
+    with input_col:
+        render_image_preview(st.session_state.get("uploaded_image_path"), max_width=340)
+        analyze_disabled = not bool(st.session_state.get("uploaded_image_path"))
+        if st.button("Analyze Meal", width="stretch", disabled=analyze_disabled):
+            try:
+                _run_inference(options, db_path)
+                st.rerun()
+            except Exception as exc:  # pragma: no cover - Streamlit-only path
+                logger.exception("Production UI inference failed")
+                st.session_state["last_error"] = str(exc)
+
+        if st.session_state.get("last_error"):
+            st.error(f"Analysis error: {st.session_state['last_error']}")
+
+        recent_rows = list_recent_meal_logs(db_path=db_path, limit=10)
+        render_recent_meal_logs(recent_rows)
+
+    with results_col:
+        formatted = st.session_state.get("formatted_result")
+        if not formatted:
+            st.info("Upload a meal photo, run analysis, then review and save the meal log.")
+            return
+
+        render_results_summary(formatted)
+        if st.session_state.get("show_pipeline_status"):
+            render_status_panel(formatted)
+
+        render_ingredients_panel(formatted)
+        if st.button("Recalculate Nutrition From Selected Ingredients", width="stretch"):
+            if _recalculate_nutrition():
+                st.rerun()
+
+        render_nutrition_panel(formatted)
+
+        default_name = (formatted.get("summary") or {}).get("top_dish") or ""
+        form_state = render_meal_log_form(default_name=default_name)
+        if form_state["save_clicked"]:
+            try:
+                _save_current_meal(form_state, db_path)
+                st.rerun()
+            except Exception as exc:  # pragma: no cover - Streamlit-only path
+                logger.exception("Saving meal log failed")
+                st.error(f"Could not save meal log: {exc}")
+
+    with st.sidebar.expander("Runtime", expanded=False):
+        st.write(f"Database: {db_path}")
+        st.write(f"Artifacts: {artifacts_root}")
+        st.write(f"Generated at: {datetime.now().isoformat(timespec='seconds')}")
+        st.json(runtime_status)
+
+
+if __name__ == "__main__":
+    main()
