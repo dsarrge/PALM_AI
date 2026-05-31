@@ -22,7 +22,11 @@ from food_ai.ui.components.upload_panel import render_image_preview, render_uplo
 from food_ai.ui.config import UISettings
 from food_ai.ui.services.formatters import format_result_for_ui
 from food_ai.ui.services.inference_service import UIInferenceOptions, run_food_inference
-from food_ai.ui.services.ingredient_weight_guardrail_service import apply_ingredient_weight_guardrails
+from food_ai.ui.services.ingredient_weight_guardrail_service import (
+    DEFAULT_INGREDIENT_WEIGHT_POLICY,
+    SUPPORTED_INGREDIENT_WEIGHT_POLICIES,
+    apply_ingredient_weight_guardrails,
+)
 from food_ai.ui.services.manual_ingredient_service import (
     apply_manual_ingredients_to_bridge_result,
     manual_exclusion_keys,
@@ -34,8 +38,14 @@ from food_ai.ui.utils.session import clear_inference_state, ensure_session_state
 
 logger = logging.getLogger(__name__)
 
+_WEIGHT_POLICY_LABELS = {
+    "mode": "Mode - most common weight",
+    "mean": "Mean - previous default",
+    "guardrail": "Guardrail - mode only for volatile rows",
+}
 
-def _sidebar_controls(settings: UISettings) -> tuple[UIInferenceOptions, Path, Path]:
+
+def _sidebar_controls(settings: UISettings) -> tuple[UIInferenceOptions, Path, Path, str]:
     st.sidebar.header("Production Settings")
     artifact_root = Path(
         st.sidebar.text_input(
@@ -52,6 +62,13 @@ def _sidebar_controls(settings: UISettings) -> tuple[UIInferenceOptions, Path, P
         )
     )
     top_k_dishes = st.sidebar.slider("Dish candidates", min_value=3, max_value=10, value=5)
+    weight_policy = st.sidebar.radio(
+        "Ingredient weight default",
+        options=list(SUPPORTED_INGREDIENT_WEIGHT_POLICIES),
+        index=list(SUPPORTED_INGREDIENT_WEIGHT_POLICIES).index(DEFAULT_INGREDIENT_WEIGHT_POLICY),
+        format_func=lambda value: _WEIGHT_POLICY_LABELS.get(value, value),
+        help="Mode is now the default for testing. Switch to Mean to compare against the previous behavior.",
+    )
     show_pipeline_status = st.sidebar.checkbox("Show pipeline status", value=False)
 
     options = UIInferenceOptions(
@@ -71,7 +88,8 @@ def _sidebar_controls(settings: UISettings) -> tuple[UIInferenceOptions, Path, P
     )
     st.session_state["prod_db_path"] = str(db_path)
     st.session_state["show_pipeline_status"] = show_pipeline_status
-    return options, artifact_root, db_path
+    st.session_state["ingredient_weight_policy"] = weight_policy
+    return options, artifact_root, db_path, weight_policy
 
 
 def _handle_image_selection(artifacts_root: Path) -> None:
@@ -95,7 +113,7 @@ def _handle_image_selection(artifacts_root: Path) -> None:
     st.session_state["status_message"] = f"Loaded image: {uploaded_file.name}"
 
 
-def _run_inference(options: UIInferenceOptions, db_path: Path) -> None:
+def _run_inference(options: UIInferenceOptions, db_path: Path, weight_policy: str) -> None:
     if not st.session_state.get("uploaded_image_path"):
         st.warning("Upload a meal image before analyzing.")
         return
@@ -105,7 +123,8 @@ def _run_inference(options: UIInferenceOptions, db_path: Path) -> None:
         options=options,
         db_path=db_path,
     )
-    guarded_result = apply_ingredient_weight_guardrails(raw_result)
+    st.session_state["raw_inference_result"] = raw_result
+    guarded_result = apply_ingredient_weight_guardrails(raw_result, policy=weight_policy)
     recalculated = recalculate_bridge_nutrition(guarded_result, [])
     formatted = format_result_for_ui(recalculated)
     st.session_state["inference_result"] = recalculated
@@ -117,7 +136,7 @@ def _run_inference(options: UIInferenceOptions, db_path: Path) -> None:
     st.session_state["last_inference_id"] = st.session_state.get("uploaded_image_digest") or options.fingerprint()
     st.session_state["last_options_fingerprint"] = options.fingerprint()
     st.session_state["last_error"] = None
-    st.session_state["status_message"] = "Meal analyzed with ingredient weight guardrails. Review ingredients and save the log when ready."
+    st.session_state["status_message"] = f"Meal analyzed with ingredient weight policy: {weight_policy}."
 
 
 def _selected_exclusion_keys() -> list[str]:
@@ -125,7 +144,7 @@ def _selected_exclusion_keys() -> list[str]:
 
 
 def _result_with_manual_ingredients(db_path: Path) -> dict:
-    base_result = st.session_state.get("base_inference_result") or st.session_state.get("inference_result")
+    base_result = st.session_state.get("raw_inference_result") or st.session_state.get("base_inference_result") or st.session_state.get("inference_result")
     if not base_result:
         raise ValueError("Analyze a meal before applying manual ingredients.")
     return apply_manual_ingredients_to_bridge_result(
@@ -135,13 +154,13 @@ def _result_with_manual_ingredients(db_path: Path) -> dict:
     )
 
 
-def _recalculate_nutrition(db_path: Path) -> bool:
+def _recalculate_nutrition(db_path: Path, weight_policy: str) -> bool:
     if not (st.session_state.get("base_inference_result") or st.session_state.get("inference_result")):
         st.warning("Analyze a meal before recalculating nutrition.")
         return False
 
     merged_result = _result_with_manual_ingredients(db_path)
-    guarded_result = apply_ingredient_weight_guardrails(merged_result)
+    guarded_result = apply_ingredient_weight_guardrails(merged_result, policy=weight_policy)
     excluded = _selected_exclusion_keys()
     ranked = guarded_result.get("ingredients_ranked") or []
     included_count = len(
@@ -160,17 +179,16 @@ def _recalculate_nutrition(db_path: Path) -> bool:
     st.session_state["nutrition_recalc_result"] = recalculated
     st.session_state["inference_result"] = recalculated
     st.session_state["formatted_result"] = formatted
-    st.session_state["status_message"] = "Nutrition recalculated from selected and manually added ingredients."
+    st.session_state["status_message"] = f"Nutrition recalculated with ingredient weight policy: {weight_policy}."
     return True
 
 
-def _save_current_meal(form_state: dict[str, object], db_path: Path) -> None:
+def _save_current_meal(form_state: dict[str, object], db_path: Path, weight_policy: str) -> None:
     if not st.session_state.get("formatted_result") or not st.session_state.get("inference_result"):
         st.warning("Analyze a meal before saving.")
         return
 
-    # Always apply the latest include/exclude edits and manually added ingredients before persisting.
-    if _recalculate_nutrition(db_path):
+    if _recalculate_nutrition(db_path, weight_policy):
         formatted = st.session_state["formatted_result"]
         inference_result = st.session_state["inference_result"]
     else:
@@ -208,7 +226,7 @@ def main() -> None:
     if runtime_status.get("degraded"):
         st.warning("Runtime is degraded. Meal logging still works, but some inference components may be unavailable.")
 
-    options, artifacts_root, db_path = _sidebar_controls(settings)
+    options, artifacts_root, db_path, weight_policy = _sidebar_controls(settings)
     _handle_image_selection(artifacts_root)
 
     status_message = st.session_state.get("status_message")
@@ -222,7 +240,7 @@ def main() -> None:
         analyze_disabled = not bool(st.session_state.get("uploaded_image_path"))
         if st.button("Analyze Meal", width="stretch", disabled=analyze_disabled):
             try:
-                _run_inference(options, db_path)
+                _run_inference(options, db_path, weight_policy)
                 st.rerun()
             except Exception as exc:  # pragma: no cover - Streamlit-only path
                 logger.exception("Production UI inference failed")
@@ -247,7 +265,7 @@ def main() -> None:
         render_ingredients_panel(formatted, allow_manual_ingredients=True, db_path=db_path)
         if st.button("Recalculate Nutrition From Selected Ingredients", width="stretch"):
             try:
-                if _recalculate_nutrition(db_path):
+                if _recalculate_nutrition(db_path, weight_policy):
                     st.rerun()
             except Exception as exc:  # pragma: no cover - Streamlit-only path
                 logger.exception("Production UI nutrition recalculation failed")
@@ -259,7 +277,7 @@ def main() -> None:
         form_state = render_meal_log_form(default_name=default_name)
         if form_state["save_clicked"]:
             try:
-                _save_current_meal(form_state, db_path)
+                _save_current_meal(form_state, db_path, weight_policy)
                 st.rerun()
             except Exception as exc:  # pragma: no cover - Streamlit-only path
                 logger.exception("Saving meal log failed")
@@ -268,6 +286,7 @@ def main() -> None:
     with st.sidebar.expander("Runtime", expanded=False):
         st.write(f"Database: {db_path}")
         st.write(f"Artifacts: {artifacts_root}")
+        st.write(f"Ingredient weight policy: {weight_policy}")
         st.write(f"Generated at: {datetime.now().isoformat(timespec='seconds')}")
         st.json(runtime_status)
 
