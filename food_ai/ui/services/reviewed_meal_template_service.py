@@ -30,6 +30,12 @@ def _dish_key(value: Any) -> str:
     return normalize_ingredient(text) or text
 
 
+def _ingredient_key(row: dict[str, Any]) -> str:
+    text = row.get("normalized_ingredient") or row.get("normalized") or row.get("ingredient") or row.get("matched_ingredient") or ""
+    clean = str(text or "").strip().lower()
+    return normalize_ingredient(clean) or clean
+
+
 def _top_dish_name(result: dict[str, Any]) -> str:
     candidates = result.get("dish_fused_topk") or result.get("dish_classifier_topk") or []
     if not candidates:
@@ -83,22 +89,83 @@ def _force_saved_grams(row: dict[str, Any]) -> dict[str, Any]:
         updated["mean_grams_per_100g_dish"] = grams
         updated["mode_grams_per_100g_dish"] = grams
     updated["reviewed_meal_template_applied"] = True
+    updated["reviewed_meal_template_source"] = "saved_log"
     updated["weight_source"] = "reviewed_meal_template"
     if not updated.get("portion_method"):
         updated["portion_method"] = "reviewed_meal_template"
+    updated["included_in_nutrition"] = bool(updated.get("included_in_nutrition", updated.get("include_in_nutrition", True)))
+    updated["include_in_nutrition"] = updated["included_in_nutrition"]
     return updated
 
 
-def _template_rows(saved_result: dict[str, Any], included_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    ranked = saved_result.get("ingredients_ranked") or []
-    visible = saved_result.get("visible_ingredients") or ranked
-    if ranked:
-        ranked_out = [_force_saved_grams(row) for row in ranked if isinstance(row, dict)]
-        visible_out = [_force_saved_grams(row) for row in visible if isinstance(row, dict)]
-        return ranked_out, visible_out
+def _force_inferred_unchecked(row: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(row)
+    updated["included_in_nutrition"] = False
+    updated["include_in_nutrition"] = False
+    updated["reviewed_meal_template_applied"] = True
+    updated["reviewed_meal_template_source"] = "current_inference_unchecked"
+    updated["exclusion_reason"] = "reviewed_template_preserves_saved_log"
+    return updated
 
-    fallback = [_force_saved_grams(row) for row in included_rows if isinstance(row, dict)]
-    return fallback, fallback
+
+def _merge_saved_and_current_rows(saved_rows: list[dict[str, Any]], current_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in saved_rows:
+        if not isinstance(row, dict):
+            continue
+        saved = _force_saved_grams(row)
+        key = _ingredient_key(saved)
+        if key:
+            seen.add(key)
+        merged.append(saved)
+    for row in current_rows:
+        if not isinstance(row, dict):
+            continue
+        key = _ingredient_key(row)
+        if key and key in seen:
+            continue
+        inferred = _force_inferred_unchecked(row)
+        if key:
+            seen.add(key)
+        merged.append(inferred)
+    return merged
+
+
+def _template_rows(
+    saved_result: dict[str, Any],
+    included_rows: list[dict[str, Any]],
+    current_ranked: list[dict[str, Any]],
+    current_visible: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    saved_ranked = saved_result.get("ingredients_ranked") or included_rows
+    saved_visible = saved_result.get("visible_ingredients") or saved_ranked
+    ranked_out = _merge_saved_and_current_rows([row for row in saved_ranked if isinstance(row, dict)], current_ranked)
+    visible_out = _merge_saved_and_current_rows([row for row in saved_visible if isinstance(row, dict)], current_visible or current_ranked)
+    return ranked_out, visible_out
+
+
+def _saved_keys(rows: list[dict[str, Any]]) -> set[str]:
+    return {_ingredient_key(row) for row in rows if isinstance(row, dict) and _ingredient_key(row)}
+
+
+def _merge_saved_palm_ready(saved_palm_ready: dict[str, Any], current_palm_ready: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(saved_palm_ready or current_palm_ready or {})
+    for key in ("matched_ingredients", "unmatched_ingredients"):
+        saved_rows = [_force_saved_grams(row) for row in (merged.get(key) or []) if isinstance(row, dict)]
+        current_rows = [row for row in ((current_palm_ready or {}).get(key) or []) if isinstance(row, dict)]
+        seen = _saved_keys(saved_rows)
+        appended = []
+        for row in current_rows:
+            row_key = _ingredient_key(row)
+            if row_key and row_key in seen:
+                continue
+            unchecked = _force_inferred_unchecked(row)
+            if row_key:
+                seen.add(row_key)
+            appended.append(unchecked)
+        merged[key] = saved_rows + appended
+    return merged
 
 
 def _overlay_template_result(current_result: dict[str, Any], template_row: dict[str, Any]) -> dict[str, Any]:
@@ -109,7 +176,9 @@ def _overlay_template_result(current_result: dict[str, Any], template_row: dict[
     saved_palm_ready = copy.deepcopy(saved_result.get("palm_ready") or {})
     saved_normalization = copy.deepcopy(saved_result.get("ingredient_normalization") or {})
 
-    ranked, visible = _template_rows(saved_result, included_rows)
+    current_ranked = [row for row in (current_result.get("ingredients_ranked") or []) if isinstance(row, dict)]
+    current_visible = [row for row in (current_result.get("visible_ingredients") or []) if isinstance(row, dict)]
+    ranked, visible = _template_rows(saved_result, included_rows, current_ranked, current_visible)
     if ranked:
         result["ingredients_ranked"] = ranked
     if visible:
@@ -117,11 +186,7 @@ def _overlay_template_result(current_result: dict[str, Any], template_row: dict[
     if saved_normalization:
         result["ingredient_normalization"] = saved_normalization
 
-    palm_ready = dict(saved_palm_ready or result.get("palm_ready") or {})
-    for key in ("matched_ingredients", "unmatched_ingredients"):
-        rows = palm_ready.get(key) or []
-        if isinstance(rows, list):
-            palm_ready[key] = [_force_saved_grams(row) for row in rows if isinstance(row, dict)]
+    palm_ready = _merge_saved_palm_ready(saved_palm_ready, dict(current_result.get("palm_ready") or {}))
     palm_ready["reviewed_meal_template"] = {
         "applied": True,
         "meal_log_id": template_row.get("meal_log_id"),
@@ -130,6 +195,7 @@ def _overlay_template_result(current_result: dict[str, Any], template_row: dict[
         "created_at": template_row.get("created_at"),
         "serving_weight_g": template_row.get("serving_weight_g"),
         "source": "meal_logs",
+        "current_inference_extra_ingredients_default_included": False,
     }
     result["palm_ready"] = palm_ready
     result["reviewed_meal_template"] = palm_ready["reviewed_meal_template"]
@@ -137,10 +203,12 @@ def _overlay_template_result(current_result: dict[str, Any], template_row: dict[
     metadata = dict(result.get("metadata") or {})
     metadata["reviewed_meal_template_applied"] = True
     metadata["reviewed_meal_template_meal_log_id"] = template_row.get("meal_log_id")
+    metadata["current_inference_extra_ingredients_default_included"] = False
     result["metadata"] = metadata
 
     warnings = list(result.get("warnings") or [])
     warnings.append("reviewed_meal_template_applied")
+    warnings.append("current_inference_extra_ingredients_unchecked")
     result["warnings"] = list(dict.fromkeys(warnings))
     result["saved_template_excluded_ingredients"] = excluded_rows
     return result
