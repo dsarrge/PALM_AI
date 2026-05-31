@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from food_ai.barcode.image_scan import scan_barcode_image
 from food_ai.config import resolve_runtime_db_path
 from food_ai.food_bridge.ingredient_normalize import normalize_ingredient
 from food_ai.food_bridge.nutrition_bridge import recalculate_bridge_nutrition
@@ -22,6 +23,7 @@ from food_ai.ui.components.results_summary import render_results_summary
 from food_ai.ui.components.status_panel import render_status_panel
 from food_ai.ui.components.upload_panel import render_image_preview, render_upload_panel
 from food_ai.ui.config import UISettings
+from food_ai.ui.services.barcode_meal_log_service import lookup_barcode_product, save_barcode_meal_log
 from food_ai.ui.services.formatters import format_result_for_ui
 from food_ai.ui.services.inference_service import UIInferenceOptions, run_food_inference
 from food_ai.ui.services.ingredient_weight_guardrail_service import (
@@ -263,6 +265,71 @@ def _save_current_meal(form_state: dict[str, object], db_path: Path, weight_poli
     )
 
 
+def _render_barcode_panel(db_path: Path) -> None:
+    st.subheader("Barcode Photo Scan")
+    barcode_file = st.file_uploader(
+        "Upload barcode photo",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="barcode_photo_upload",
+        help="Crop tightly around the UPC/EAN barcode for best results.",
+    )
+    manual_barcode = st.text_input("Or enter barcode manually", key="barcode_manual_input")
+
+    if st.button("Scan / Lookup Barcode", width="stretch", key="scan_barcode_button"):
+        barcode = "".join(ch for ch in str(manual_barcode or "") if ch.isdigit())
+        scan_result: dict[str, Any] | None = None
+        if not barcode and barcode_file is not None:
+            scan_result = scan_barcode_image(barcode_file.getvalue())
+            barcode = str(scan_result.get("barcode") or "")
+        if scan_result is not None:
+            st.session_state["barcode_scan_result"] = scan_result
+        if not barcode:
+            st.warning("No barcode found. Upload a clearer barcode photo or enter the digits manually.")
+            return
+        lookup = lookup_barcode_product(barcode, db_path=db_path)
+        st.session_state["barcode_lookup_result"] = lookup
+
+    scan_result = st.session_state.get("barcode_scan_result")
+    if scan_result:
+        st.caption(f"Scan status: {scan_result.get('status')} | decoder: {scan_result.get('decoder') or 'n/a'}")
+        if scan_result.get("message"):
+            st.info(str(scan_result["message"]))
+
+    lookup = st.session_state.get("barcode_lookup_result")
+    if not lookup:
+        return
+    if lookup.get("status") == "unknown_barcode":
+        st.warning(f"Barcode not found locally. Saved to unknown_barcodes: {lookup.get('barcode')}")
+        return
+    if lookup.get("status") != "found":
+        st.warning(f"Barcode lookup status: {lookup.get('status')}")
+        return
+
+    product = lookup.get("product") or {}
+    st.success(f"Found: {product.get('brand') or ''} {product.get('product_name') or ''}".strip())
+    serving_default = float(product.get("serving_size_default_g") or 100.0)
+    grams = st.number_input(
+        "Grams consumed",
+        min_value=1.0,
+        max_value=5000.0,
+        value=max(1.0, serving_default),
+        step=1.0,
+        key="barcode_grams_consumed",
+    )
+    st.json({"barcode": lookup.get("barcode"), "product": product})
+    if st.button("Save Barcode Food Log", width="stretch", key="save_barcode_food_log_button"):
+        saved = save_barcode_meal_log(
+            barcode=str(lookup.get("barcode") or ""),
+            grams_consumed=float(grams),
+            db_path=db_path,
+        )
+        if saved.get("status") == "saved":
+            st.success(f"Saved barcode food log: {saved.get('grams_consumed'):g}g")
+            st.session_state["barcode_lookup_result"] = None
+        else:
+            st.warning(f"Could not save barcode food log: {saved}")
+
+
 def main() -> None:
     st.set_page_config(page_title="PALM Meal Logger", layout="wide")
     settings = UISettings()
@@ -299,6 +366,9 @@ def main() -> None:
 
         if st.session_state.get("last_error"):
             st.error(f"Analysis error: {st.session_state['last_error']}")
+
+        with st.expander("Packaged food barcode", expanded=False):
+            _render_barcode_panel(db_path)
 
         recent_rows = list_recent_meal_logs(db_path=db_path, limit=10)
         render_recent_meal_logs(recent_rows)
