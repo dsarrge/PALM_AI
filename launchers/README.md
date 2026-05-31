@@ -10,6 +10,9 @@ Using the full interpreter path avoids broken `conda activate` and PowerShell ac
 
 - `run_palm_ui.bat`
   - starts the local Streamlit tester
+- `run_palm_meal_logger.bat`
+  - starts the production meal logging UI at `food_ai/ui/production_app.py`
+  - saves reviewed meal logs to the selected PALM SQLite database
 - `run_food_smoke_test.bat`
   - runs a food-vision smoke test against `food_ai/tests/food_1.jpg`
   - writes JSON output to `artifacts/vision/smoke/smoke_result.json`
