@@ -8,6 +8,8 @@ from food_ai.food_bridge.ingredient_normalize import normalize_ingredient
 from food_ai.food_bridge.nutrition_bridge import NUTRIENT_KEYS, lookup_ingredient_nutrition
 
 
+MIN_INFERRED_RECIPE_SOURCE_COUNT = 10
+
 COOKED_DISH_KEYWORDS = (
     "lasagna",
     "spaghetti",
@@ -51,6 +53,30 @@ def _as_float(value: Any) -> float:
         return 0.0
 
 
+def _source_count(row: dict[str, Any]) -> float:
+    return _as_float(
+        row.get("source_count")
+        or row.get("recipe_count")
+        or row.get("n_recipes")
+        or row.get("n_weight_observations")
+        or row.get("recipe_hits")
+    )
+
+
+def _is_manual_or_user_row(row: dict[str, Any]) -> bool:
+    return bool(
+        row.get("manual_ingredient")
+        or row.get("weight_source") in {"user_manual", "user_edited_grams_per_100g_dish"}
+        or row.get("portion_method") in {"user_entered_grams_per_100g_dish", "user_edited_grams_per_100g_dish"}
+    )
+
+
+def _passes_source_count_filter(row: dict[str, Any]) -> bool:
+    if _is_manual_or_user_row(row):
+        return True
+    return _source_count(row) > MIN_INFERRED_RECIPE_SOURCE_COUNT
+
+
 def _top_dish_label(result: dict[str, Any]) -> str:
     fused = result.get("dish_fused_topk") or result.get("dish_classifier_topk") or []
     if not fused:
@@ -77,7 +103,7 @@ def _dedupe_key(row: dict[str, Any]) -> str:
 def _row_score(row: dict[str, Any]) -> tuple[float, float, float, float, str]:
     include = 1.0 if bool(row.get("included_in_nutrition", row.get("default_include", True))) else 0.0
     grams = _as_float(row.get("grams_per_100g_dish") or row.get("grams_default"))
-    source_count = _as_float(row.get("source_count") or row.get("recipe_count") or row.get("n_weight_observations"))
+    source_count = _source_count(row)
     confidence = _as_float(row.get("confidence") or row.get("confidence_score"))
     return include, grams, source_count, confidence, _ingredient_text(row)
 
@@ -182,9 +208,9 @@ def clean_ingredient_candidates_for_nutrition(
 ) -> dict[str, Any]:
     """Apply pre-nutrition candidate cleanup for production meal logging.
 
-    This filters semantic duplicates before the reviewed nutrition calculation and
-    defaults cooked dishes to cooked ingredient names where the normalized ingredient
-    identity is stable. Nutrition still comes from PALM's existing DB lookup path.
+    This filters weak inferred rows, filters semantic duplicates before the reviewed
+    nutrition calculation, and defaults cooked dishes to cooked ingredient names.
+    Nutrition still comes from PALM's existing DB lookup path.
     """
     result = copy.deepcopy(inference_result)
     cooked_dish = _is_cooked_dish(result)
@@ -192,8 +218,19 @@ def clean_ingredient_candidates_for_nutrition(
     source_rows = result.get("ingredients_ranked") or result.get("visible_ingredients") or []
     prepared_rows: list[dict[str, Any]] = []
     prep_audits: list[dict[str, Any]] = []
+    source_filter_audits: list[dict[str, Any]] = []
     for row in source_rows:
         if not isinstance(row, dict):
+            continue
+        if not _passes_source_count_filter(row):
+            source_filter_audits.append(
+                {
+                    "ingredient": _ingredient_text(row),
+                    "source_count": _source_count(row),
+                    "minimum_required_exclusive": MIN_INFERRED_RECIPE_SOURCE_COUNT,
+                    "reason": "source_count_not_greater_than_minimum",
+                }
+            )
             continue
         prepared, audit = _apply_cooked_default(row, cooked_dish=cooked_dish)
         prepared_rows.append(prepared)
@@ -227,6 +264,9 @@ def clean_ingredient_candidates_for_nutrition(
     palm_ready["matched_ingredients"] = matched
     palm_ready["unmatched_ingredients"] = unmatched
     palm_ready["ingredient_candidate_cleanup"] = {
+        "minimum_inferred_recipe_source_count_exclusive": MIN_INFERRED_RECIPE_SOURCE_COUNT,
+        "source_count_filter_applied": True,
+        "source_count_filtered_count": len(source_filter_audits),
         "cooked_dish_default_applied": bool(prep_audits),
         "cooked_dish_detected": cooked_dish,
         "input_count": len(source_rows),
@@ -235,6 +275,7 @@ def clean_ingredient_candidates_for_nutrition(
         "prep_default_count": len(prep_audits),
         "matched_count": len(matched),
         "unmatched_count": len(unmatched),
+        "source_count_filter_audits": source_filter_audits,
         "prep_audits": prep_audits,
         "duplicate_audits": duplicate_audits,
         "lookup_audits": lookup_audits,
@@ -250,10 +291,13 @@ def clean_ingredient_candidates_for_nutrition(
             "unmatched_count": len(unmatched),
             "deduped_count": len(deduped_rows),
             "duplicate_count": len(duplicate_audits),
+            "source_count_filtered_count": len(source_filter_audits),
         }
         result["ingredient_normalization"] = normalization
 
     warnings = list(result.get("warnings") or [])
+    if source_filter_audits:
+        warnings.append("low_source_count_ingredients_filtered")
     if duplicate_audits:
         warnings.append("duplicate_ingredient_candidates_filtered")
     if prep_audits:
@@ -264,4 +308,4 @@ def clean_ingredient_candidates_for_nutrition(
     return result
 
 
-__all__ = ["clean_ingredient_candidates_for_nutrition"]
+__all__ = ["MIN_INFERRED_RECIPE_SOURCE_COUNT", "clean_ingredient_candidates_for_nutrition"]
