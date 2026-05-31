@@ -240,7 +240,7 @@ def main() -> None:
         if st.session_state.get("show_pipeline_status"):
             render_status_panel(formatted)
 
-        render_ingredients_panel(formatted, allow_manual_ingredients=True)
+        render_ingredients_panel(formatted, allow_manual_ingredients=True, db_path=db_path)
         if st.button("Recalculate Nutrition From Selected Ingredients", width="stretch"):
             try:
                 if _recalculate_nutrition(db_path):
